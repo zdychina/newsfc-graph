@@ -1,0 +1,44 @@
+---
+id: "UNC@Feature@WSFD-900101-激活5G SA国际漫游"
+type: Feature
+name: "激活5G SA国际漫游"
+nf: UNC
+version: 20.15.2
+feature_code: WSFD-900101
+doc_type: 激活
+mock: true
+---
+
+# 激活5G SA国际漫游
+
+【模拟数据】激活文档。
+
+## 前提条件
+
+已加载 License LKV2SAIRA01；已完成 AMF 本局数据与 SBI 接口配置。
+
+## 操作步骤
+
+1. 配置跨 PLMN 通信方式。经 SEPP 时执行 **SET ROAMCOMMPLCY**（ROUTEMODE=SEPP）；直连对端 PLMN 时 ROUTEMODE=DIRECT，无需配置 SEPP 对端。
+2. （经 SEPP 时）执行 **ADD PNFPROFILE**（NFTYPE=NfSEPP）配置 SEPP 对端，执行 **ADD SEPPBINDGRP** 将 SEPP 实例加入 SEPP 组，执行 **ADD PLMNBINDSEPPGRP** 将对端 PLMN 绑定到 SEPP 组。
+3. 执行 **MOD AMFINFO** 配置 PLMN 间 AMF 名称（INTERPLMNFQDN）。
+4. 执行 **MOD NFSERVICE** 为各服务实例配置 PLMN 间域名（INTERPLMNFQDN）。
+5. 执行 **SET DNNCMPT** 配置漫游会话的 DNN 携带格式。HR 漫游必须携带完整 DNN（NIANDOI）；LBO 漫游可按对端能力选择 NI 或 NIANDOI。
+6. 执行 **SET AMFROAMFUNC** 配置漫游用户移动限制处理方式。
+7. 执行 **SET NGMMFUNC**（ROAMINGSW=ON）打开漫游功能开关。**本步骤必须最后执行**，开关打开后漫游用户立即可以接入。
+
+## 任务示例
+
+```
+SET ROAMCOMMPLCY: ROUTEMODE=SEPP, SEPPMODE=TARGETAPIROOT;
+ADD PNFPROFILE: NFINSTANCEID="SEPP_1", NFTYPE=NfSEPP, NFSTATUS=Registered, IPADDRESSTYPE=IPTypeV4, IPV4ADDRESS1="192.0.2.10", PORT=80;
+ADD SEPPBINDGRP: NFINSTANCEID="SEPP_1", GROUPID=2;
+ADD PLMNBINDSEPPGRP: MCC="001", MNC="01", GROUPID=2;
+MOD AMFINFO: AMFINSTANCENAME="AMF_1", INTERPLMNFQDN="amf1.5gc.mnc001.mcc001.3gppnetwork.org";
+SET DNNCMPT: HRUSRFMT=NIANDOI, LBOUSRFMT=NI;
+SET NGMMFUNC: ROAMINGSW=ON;
+```
+
+## 边
+- 属于特性: [[UNC@Feature@WSFD-900101]]
+- 使用命令: [[UNC@MMLCommand@SET ROAMCOMMPLCY]], [[UNC@MMLCommand@ADD PNFPROFILE]], [[UNC@MMLCommand@ADD SEPPBINDGRP]], [[UNC@MMLCommand@ADD PLMNBINDSEPPGRP]], [[UNC@MMLCommand@MOD AMFINFO]], [[UNC@MMLCommand@MOD NFSERVICE]], [[UNC@MMLCommand@SET DNNCMPT]], [[UNC@MMLCommand@SET AMFROAMFUNC]], [[UNC@MMLCommand@SET NGMMFUNC]]

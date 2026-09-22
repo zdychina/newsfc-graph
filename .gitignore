@@ -38,3 +38,8 @@ graph-asset-platform/gap.tar
 _imports.log
 .DS_Store
 Thumbs.db
+
+# ===== graph-build 产出（含用户/运营商语料，不入库）=====
+graph-build-output/
+mock-graph-mcp/data/
+mock-graph-mcp/logs/
