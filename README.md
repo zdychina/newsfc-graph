@@ -28,7 +28,7 @@
 | 想理解"怎么构建图谱" | `② 三层图谱构建规范/` |
 | 想看"图谱长什么样 / 规模" | `③ 三层图谱资产/` |
 | 想浏览、上传、查询图谱 | `④ graph-asset-platform/` |
-| 想用图谱生成配置 / 排障 | `④` 平台 ＋ `②` 里的 `skill/`、`graph-query-skill/` |
+| 想用图谱生成配置 / 排障 | `④` 平台 ＋ 根目录 `config-generation/` ＋ `②` 里的 `graph-query-skill/` |
 
 ---
 
@@ -69,7 +69,7 @@
 
 每层同构：`agent.md`（构建师人设）→ `SKILL.md`（构建方法）→ `字段定义.md` → `template/` → `check.md`（核查）→ `change-requests/`，自带"构建 → 核查 → 反馈"闭环。
 
-**顶层全局**：`README / VERSION / CHANGELOG / 演进机制 / 层包标准`（治理）、`conventions/`（通用约定）、`scripts/`（阶段0 导出器）、`skill/`（配置生成 Skill）、`graph-query-skill/`（通用查询 Skill）。
+**顶层全局**：`README / VERSION / CHANGELOG / 演进机制 / 层包标准`（治理）、`conventions/`（通用约定）、`scripts/`（阶段0 导出器）、`graph-query-skill/`（通用查询 Skill）。配置生成 Skill 已移到仓库根目录 `config-generation/`。
 
 📖 入口：[`三层图谱构建规范/README.md`](三层图谱构建规范/README.md) · [`层包标准`](三层图谱构建规范/层包标准.md) · [`演进机制`](三层图谱构建规范/演进机制.md) · [`conventions/命名规范`](三层图谱构建规范/conventions/命名规范-建议.md)
 
@@ -171,7 +171,7 @@ cd graph-asset-platform/backend && python -m uvicorn app.main:app --port 8000
 
 ### 我想消费图谱（生成配置 / 排障 / 查询）→ 用 Skill
 
-- 配置生成：[`三层图谱构建规范/skill/SKILL.md`](三层图谱构建规范/skill/SKILL.md)（`config-generation`）
+- 配置生成：[`config-generation/SKILL.md`](config-generation/SKILL.md)（`config-generation`）
 - 通用查询：[`三层图谱构建规范/graph-query-skill/SKILL.md`](三层图谱构建规范/graph-query-skill/SKILL.md)（`graph-query`）
 - Skill/Agent 沿对象 md 的 `[[ID]]` 引用，经平台 MCP 服务（`/mcp`，工具 `get_md` 等 5 个）逐层取，不全量加载——详见 [`graph-asset-platform/图谱平台接口文档.md`](graph-asset-platform/图谱平台接口文档.md)。
 
@@ -203,6 +203,6 @@ cd graph-asset-platform/backend && python -m uvicorn app.main:app --port 8000
 | 规范怎么演进 | [`演进机制.md`](三层图谱构建规范/演进机制.md) · [`CHANGELOG.md`](三层图谱构建规范/CHANGELOG.md) |
 | 命名 / ID / 图片引用约定 | [`conventions/`](三层图谱构建规范/conventions/) |
 | 阶段0 产品文档导出 | [`scripts/README.md`](三层图谱构建规范/scripts/README.md) |
-| 配置生成 Skill | [`skill/SKILL.md`](三层图谱构建规范/skill/SKILL.md) |
+| 配置生成 Skill | [`config-generation/SKILL.md`](config-generation/SKILL.md) |
 | 通用查询 Skill | [`graph-query-skill/SKILL.md`](三层图谱构建规范/graph-query-skill/SKILL.md) |
 | 资产管理平台 | [`graph-asset-platform/README.md`](graph-asset-platform/README.md) |
