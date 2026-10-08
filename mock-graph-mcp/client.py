@@ -4,6 +4,7 @@
     python client.py domains
     python client.py md "UNC@MMLCommand@ADD PNFPROFILE" "UNC@AtomTask@ADD PNFPROFILE" [--version 20.15.2] [--raw]
     python client.py search "SET NGPAGINGCTRL" "ADD NGPAGINGRULE" [--match all] [--type Feature] [--nf UNC] [--layer 特性层]
+    python client.py files [--query "ADD GUAMI"] [--path AtomTask/UNC] [--ext md] [--recursive] [--limit 100] [--after <cursor>]
     python client.py call get_md '{"ids": ["..."]}'        # 任意工具 + 原始参数（校验未知参数等）
 
 归因字段取环境变量 _AGENT_USERNAME / _AGENT_SESSION_ID（缺省 mock-tester / mock-session）。
@@ -68,6 +69,13 @@ def main():
         p.add_argument(f"--{f}")
     p.add_argument("--page", type=int)
     p.add_argument("--size", type=int)
+    p = sub.add_parser("files")
+    p.add_argument("--query")
+    p.add_argument("--path")
+    p.add_argument("--ext")
+    p.add_argument("--recursive", action="store_true")
+    p.add_argument("--limit", type=int)
+    p.add_argument("--after")
     p = sub.add_parser("call")
     p.add_argument("tool")
     p.add_argument("args", nargs="?", default="{}")
@@ -97,13 +105,29 @@ def main():
                 args[f] = getattr(a, f)
         out, err = call("search_graph", args)
         if not err:
-            print(f"total={out['total']} has_more={out['has_more']} facets={json.dumps(out['facets'], ensure_ascii=False)}")
+            print(f"total={out['total']} bounded={out['total_is_bounded']} has_more={out['has_more']} "
+                  f"facets={json.dumps(out['facets'], ensure_ascii=False)}")
             print(f"term_counts={json.dumps(out['diagnostics']['term_counts'], ensure_ascii=False)} "
-                  f"recovery={out['diagnostics']['recovery_codes']}")
+                  f"term_stats={json.dumps(out['diagnostics']['term_stats'], ensure_ascii=False)}")
+            print(f"recovery={out['diagnostics']['recovery_codes']} "
+                  f"body_skipped={out['diagnostics']['body_skipped_short_terms']}")
             for h in out["hits"]:
                 print(f"- {h['id']}  [{h['type']}] {h['name']}  matched={h['matched_terms']} in={h['matched_in']}")
                 for s in h["snippets"]:
                     print(f"    · {s['text'][:140]}")
+            return
+    elif a.cmd == "files":
+        args = {k: v for k, v in {"query": a.query, "path": a.path, "ext": a.ext,
+                                   "recursive": a.recursive or None, "limit": a.limit,
+                                   "after": a.after}.items() if v is not None}
+        out, err = call("search_files", args)
+        if not err:
+            print(f"total={out['total']} bounded={out['total_is_bounded']} has_more={out['has_more']} "
+                  f"cursor={out['next_cursor']} applied={json.dumps(out['applied_filters'], ensure_ascii=False)}")
+            for f in out["files"]:
+                tag = "DIR " if f["is_dir"] else f["ext"]
+                link = f" → {f['obj_id']}" + (f"@{f['version']}" if f["version"] else "") if f["obj_id"] else ""
+                print(f"- [{tag}] {f['path']}{link}")
             return
     else:
         out, err = call(a.tool, json.loads(a.args))

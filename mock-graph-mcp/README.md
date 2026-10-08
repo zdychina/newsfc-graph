@@ -1,6 +1,6 @@
 # mock-graph-mcp：模拟 Graph MCP 服务
 
-在访问不到内网图谱平台的环境里测试 `graph-build` skill。工具契约（`get_domains` / `search_graph` / `get_md` 的参数、返回和错误码）对齐 `graph-asset-platform/图谱平台接口文档.md`。**所有数据都是模拟的**：命令参数由测试语料自动推断得出，特性码 `WSFD-9001xx` 是虚构的，只用于验证流程，不能用来判断映射是否准确。
+在访问不到内网图谱平台的环境里测试 `graph-build` skill。工具契约（`get_domains` / `search_graph` / `get_md` / `search_files` 的参数、返回和错误码）对齐 `graph-asset-platform/图谱平台接口文档.md`。**所有数据都是模拟的**：命令参数由测试语料自动推断得出，特性码 `WSFD-9001xx` 是虚构的，只用于验证流程，不能用来判断映射是否准确。
 
 只依赖 Python 3 标准库。
 
@@ -17,6 +17,15 @@ python server.py
 python client.py domains
 python client.py md "UNC@MMLCommand@SET ROAMCOMMPLCY" "UNC@AtomTask@ADD PNFPROFILE"
 python client.py search LKV2SAIRA01 --type License
+python client.py files --query "ADD GUAMI"          # 文件名搜索（find/ls 语义）
+python client.py files --path AtomTask/UNC           # 列目录直接子项；--recursive 递归全部文件
+```
+
+演练 search_graph 新契约的截断 / 短词路径（可选环境变量）：
+
+```bash
+MOCK_POOL_CAP=5 python server.py                     # 每词候选池缩到 5 → 宽词 total_is_bounded=true + 截断提示
+MOCK_SHORT_TERM_MODE=metadata_only python server.py  # 2 字词只搜元数据（默认 body_like，1 字词恒只搜元数据）
 ```
 
 ### 接入 Claude Code
