@@ -57,6 +57,10 @@ def test_skill_user_rest_denied_frontend_endpoints(tmp_path, monkeypatch, tmp_da
     with TestClient(app) as c:
         h = {"X-API-Key": "gap_sk"}
         assert c.get("/api/v1/objects", headers=h).status_code == 403
+        # /files（2026-09-29）：skill 权限放行 → 路由层校验空 body 拒 422 envelope
+        r_files = c.post("/api/v1/files", headers=h, json={})
+        assert r_files.status_code == 422
+        assert r_files.json()["error"]["code"] == "INVALID_ARGUMENT"
 
 
 def test_frontend_user_can_objects(tmp_path, monkeypatch, tmp_data_dir):
@@ -120,6 +124,13 @@ def test_graph_routes_403_uses_error_envelope(tmp_path, monkeypatch, tmp_data_di
         r_search = c.post("/api/v1/search", headers={"X-API-Key": "gap_sk"}, json={})
         assert r_search.status_code == 422
         assert r_search.json()["error"]["code"] == "INVALID_ARGUMENT"
+        # /files（2026-09-29）同款：无 skill 权限 → 403 envelope；can_skill 放行 → 422
+        r_files_403 = c.post("/api/v1/files", headers={"X-API-Key": "gap_am"}, json={})
+        assert r_files_403.status_code == 403
+        assert r_files_403.json()["error"]["code"] == "PERMISSION_DENIED"
+        r_files = c.post("/api/v1/files", headers={"X-API-Key": "gap_sk"}, json={})
+        assert r_files.status_code == 422
+        assert r_files.json()["error"]["code"] == "INVALID_ARGUMENT"
 
 
 # ---------------- assets / upload / test 权限 ----------------

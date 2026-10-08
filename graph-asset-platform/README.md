@@ -51,7 +51,7 @@ graph-asset-platform/
 cd graph-asset-platform/backend && python -m uvicorn app.main:app --port 8000
 ```
 
-> **鉴权（v2 用户体系）**：`platform-data/users.json` 存用户（明文 KEY，不入 git）。前端访问跳登录页（用户名+KEY，仅 `can_frontend` 用户可登录）；Agent 可走 MCP 服务（`/mcp`）或 REST 兼容接口（`POST /api/v1/domains`、`POST /api/v1/md`、`POST /api/v1/search`，与 MCP 三公开工具同契约），均在 header 传 `X-API-Key: <用户KEY>`、每次调用传同名字段 `AGENT_USERNAME`/`AGENT_SESSION_ID`（MCP 工具参数或 REST JSON body），详见 `图谱平台接口文档.md`。**不再使用 `GAP_API_KEY` 环境变量**。
+> **鉴权（v2 用户体系）**：`platform-data/users.json` 存用户（明文 KEY，不入 git）。前端访问跳登录页（用户名+KEY，仅 `can_frontend` 用户可登录）；Agent 可走 MCP 服务（`/mcp`）或 REST 兼容接口（`POST /api/v1/domains`、`POST /api/v1/md`、`POST /api/v1/search`、`POST /api/v1/files`，与 MCP 四公开工具同契约），均在 header 传 `X-API-Key: <用户KEY>`、每次调用传同名字段 `AGENT_USERNAME`/`AGENT_SESSION_ID`（MCP 工具参数或 REST JSON body），详见 `图谱平台接口文档.md`。**不再使用 `GAP_API_KEY` 环境变量**。
 >
 > **初始化 admin**：`users.json` 不存在或为空时无法登录。生成初始 admin（打印 KEY）：
 > ```bash
@@ -65,8 +65,9 @@ cd graph-asset-platform/backend && python -m uvicorn app.main:app --port 8000
 - Swagger：http://localhost:8000/docs
 - API 根：http://localhost:8000/api/v1
 
-**Agent 接入（MCP）**：端点 `http://<host>:8000/mcp`（`X-API-Key` 鉴权，3 个公开工具：
-get_domains / search_graph / get_md——统一搜索与权威原文读取；旧 3 工具 hidden 兼容 deprecated）。
+**Agent 接入（MCP）**：端点 `http://<host>:8000/mcp`（`X-API-Key` 鉴权，4 个公开工具：
+get_domains / search_graph / search_files / get_md——统一搜索、文件名/目录浏览与权威原文读取；
+旧 3 工具 hidden 兼容 deprecated）。
 完整配置见 [docs/MCP配置指南.md](docs/MCP配置指南.md)，工具明细见 [图谱平台接口文档.md](图谱平台接口文档.md)。
 
 ### 一次性环境准备
@@ -152,6 +153,7 @@ curl -F "file=@sample.zip" http://localhost:8000/api/v1/import
 | `GET /objects/{id}/md?version=` | 原始 md |
 | `GET /subgraph?center=&hops=&type=&version=` | N 跳子图 |
 | `GET /telemetry/stats?days=30` | SKILL 取用频次聚合（total/by_type/top_ids/timeline，统计页展示） |
+| `POST /domains`、`/md`、`/search`、`/files` | Agent REST 兼容接口（与 MCP 四公开工具同契约；`X-API-Key` + 归因字段，见 `图谱平台接口文档.md`） |
 
 > `{id}` 含 `@` 和空格，URL 须 encode（`@`→`%40`、空格→`%20`）。`?version=X` 不在该 id 可用版本时 → 404 + `available_versions`。
 

@@ -1,7 +1,8 @@
 """统一搜索 search_graph 测试（M2，需求 §7/§15.1）。
 
 覆盖：terms/any/all、短语 term、短词（<3 字符）、元数据等级排序、RRF、
-filter/latest 前置、预算、facets、分页、recovery_codes、错误码区分。
+filter/latest 前置、池上限（POOL_CAP 触顶截断）、facets、分页、
+recovery_codes、错误码区分。
 """
 import io
 import zipfile
@@ -387,18 +388,18 @@ def test_hit_fields_required_shape(tmp_data_dir, monkeypatch):
     assert "免费RG" in hit["snippets"][0]["text"]
 
 
-# ---------------- 19 预算 ----------------
+# ---------------- 19 池上限（POOL_CAP 触顶截断，SEARCH_TOO_BROAD 退场） ----------------
 
-def test_search_too_broad_budget(tmp_data_dir, monkeypatch):
-    _setup(tmp_data_dir, monkeypatch)
+def test_pool_cap_truncation_returns_bounded(populated, monkeypatch):
+    """SEARCH_TOO_BROAD 退场：池触顶不再报错——正常返回 + total_is_bounded +
+    截断建议。monkeypatch POOL_CAP=2 强制触顶，语义不依赖语料规模。"""
     from app.graph_query import search as search_mod
-    m2 = pytest.MonkeyPatch()
-    m2.setattr(search_mod, "SEARCH_BUDGET", 0)
-    try:
-        e = _err_of(terms=["计费"])
-        assert e.code == gq.SEARCH_TOO_BROAD
-    finally:
-        m2.undo()
+    monkeypatch.setattr(search_mod, "POOL_CAP", 2)
+    out = search_graph_core(terms=["计费"])  # 种子里 ≥4 个对象元数据含"计费"
+    assert out["total"] >= 1
+    assert out["total_is_bounded"] is True
+    assert out["diagnostics"]["term_stats"]["计费"]["capped"] is True
+    assert any("截断" in s for s in out["suggestions"])
 
 
 # ---------------- 22/23 零结果诊断 ----------------
@@ -417,6 +418,8 @@ def test_zero_result_recovery_remove_term(tmp_data_dir, monkeypatch):
     assert out["total"] == 0
     assert "REMOVE_OR_REPHRASE_TERM" in out["diagnostics"]["recovery_codes"]
     assert out["diagnostics"]["term_counts"]["不存在的词xyz"] == 0
+    assert out["diagnostics"]["term_stats"]["不存在的词xyz"] == \
+        {"hit": False, "capped": False}
 
 
 def test_zero_result_recovery_relax_filters(tmp_data_dir, monkeypatch):
@@ -430,7 +433,8 @@ def test_zero_result_recovery_relax_filters(tmp_data_dir, monkeypatch):
 def test_term_counts_present_on_success(tmp_data_dir, monkeypatch):
     _setup(tmp_data_dir, monkeypatch)
     out = search_graph_core(terms=["计费", "免费RG"], match="any")
-    assert out["diagnostics"]["term_counts"]["免费RG"] >= 1
+    assert out["diagnostics"]["term_counts"]["免费RG"] > 0
+    assert out["diagnostics"]["term_stats"]["免费RG"]["hit"] is True
 
 
 # ---------------- 输出契约 ----------------
@@ -438,8 +442,9 @@ def test_term_counts_present_on_success(tmp_data_dir, monkeypatch):
 def test_response_contract_fields(tmp_data_dir, monkeypatch):
     _setup(tmp_data_dir, monkeypatch)
     out = search_graph_core(terms=["URR"])
-    for f in ("terms", "match", "applied_filters", "total", "page", "size",
-              "has_more", "next_page", "hits", "facets", "diagnostics", "suggestions"):
+    for f in ("terms", "match", "applied_filters", "total", "total_is_bounded",
+              "page", "size", "has_more", "next_page", "hits", "facets",
+              "diagnostics", "suggestions"):
         assert f in out, f
     assert out["match"] == "any"
     assert out["applied_filters"] == {}
@@ -481,3 +486,260 @@ def test_catalog_nf_case_conflict_integrity_error(tmp_data_dir, monkeypatch):
     with pytest.raises(gq.GraphQueryError) as ei:
         catalog.nfs(s.db)
     assert ei.value.error.code == gq.INTERNAL_ERROR
+
+
+# ---------------- 有界候选池（2026-09-29 超时治理 Task 9） ----------------
+
+@pytest.fixture
+def populated(tmp_data_dir, monkeypatch):
+    """Task 10/11 共用：种子语料 + 全局 service 就绪。"""
+    _setup(tmp_data_dir, monkeypatch)  # 该文件既有的种子辅助（各测试体内同款调用）
+    from app.service import get_service
+    return get_service()
+
+
+def test_broad_term_returns_truncated_not_error(populated):
+    """宽泛词不再 SEARCH_TOO_BROAD 报错：正常返回 + total_is_bounded。"""
+    out = search_graph_core(terms=["配置"])  # 种子语料里的高频词（3 个对象正文含"配置"）
+    assert out["total"] >= 1
+    if out["total_is_bounded"]:
+        assert out["total"] <= 10_000
+        assert any("截断" in s for s in out["suggestions"])
+
+
+def test_term_counts_remain_integer_compatible_with_explicit_term_stats(populated):
+    out = search_graph_core(terms=["ADD URR", "不存在词xyz"])
+    tc = out["diagnostics"]["term_counts"]
+    stats = out["diagnostics"]["term_stats"]
+    # term_counts 是既有公开契约，旧调用方仍可直接做 count > 0。
+    assert tc["ADD URR"] > 0
+    assert tc["不存在词xyz"] == 0
+    assert stats["ADD URR"] == {"hit": True, "capped": False}
+    assert stats["不存在词xyz"] == {"hit": False, "capped": False}
+
+
+def test_total_is_bounded_field_present(populated):
+    out = search_graph_core(terms=["ADD URR"])
+    assert isinstance(out["total_is_bounded"], bool)
+
+
+# ---------------- 短词两档（2026-09-29 超时治理 Task 10） ----------------
+
+def test_two_char_term_body_like_mode(populated):
+    """默认 body_like 档：两字词走 LIKE，能命中正文（沿用既有行为，回归锚）。"""
+    out = search_graph_core(terms=["配额"])  # FEAT_BILLING 正文含「配额管理」
+    assert any(h["id"] == "UDG@Feature@GWFD-020300" for h in out["hits"])
+    assert "配额" not in out["diagnostics"].get("body_skipped_short_terms", [])
+
+
+def test_two_char_term_metadata_only_mode(populated):
+    """metadata_only 降级档：两字词只搜元数据（跳过正文）并写入诊断回显。"""
+    svc = populated
+    svc.db.execute(
+        "INSERT INTO meta(key, value) VALUES('search_short_term_mode',"
+        "'metadata_only') ON CONFLICT(key) DO UPDATE SET value='metadata_only'")
+    svc.db.commit()
+    import app.graph_query.search as s
+    s._last_good_mode = "body_like"  # 强制下轮重读（当前每请求直读，防御缓存化）
+    try:
+        # 种子元数据（id/name/name_zh）均不含「配额」——只有正文含
+        out = search_graph_core(terms=["配额"])
+        assert all(h["id"] != "UDG@Feature@GWFD-020300" for h in out["hits"])
+        assert "配额" in out["diagnostics"].get("body_skipped_short_terms", [])
+    finally:
+        svc.db.execute("DELETE FROM meta WHERE key='search_short_term_mode'")
+        svc.db.commit()
+        s._last_good_mode = "body_like"
+
+
+def test_one_char_term_metadata_only(populated):
+    """1 字符恒只搜元数据（与开关档位无关）。"""
+    out = search_graph_core(terms=["配"])
+    assert "配" in out["diagnostics"].get("body_skipped_short_terms", [])
+
+
+# ---------------- catalog 校验缓存（2026-09-29 超时治理 Task 11） ----------------
+
+def test_catalog_cached_until_invalidate(populated):
+    from app.graph_query import catalog
+    conn = populated.db
+    v1 = catalog.versions(conn)
+    conn.execute("INSERT INTO objects(id, version, type, layer, scope, "
+                 "source_path, name, frontmatter_json, body_md, raw_md, mtime) "
+                 "VALUES('zz@MMLCommand@NEW', '99.0.0', 'MMLCommand', 'Command',"
+                 "'nf', 'x.md', 'NEW', '{}', '', '', 0.0)")
+    conn.commit()
+    assert catalog.versions(conn) == v1            # 未失效 → 命中缓存
+    catalog.invalidate()
+    assert "99.0.0" in catalog.versions(conn)      # 失效 → 重查
+    catalog.invalidate()
+
+
+def test_reload_index_invalidates_catalog(populated):
+    import app.graph_query.catalog as catalog
+    catalog.versions(populated.db)  # 先填缓存——证明 reload 真失效（非仅属性存在）
+    assert catalog._cache
+    populated.reload_index()
+    assert catalog._cache == {}  # reload（写路径末尾）即失效
+
+
+def test_rebuild_invalidates_catalog(populated):
+    import app.graph_query.catalog as catalog
+    catalog.versions(populated.db)
+    populated.rebuild()
+    assert catalog._cache == {}  # rebuild 锁内末尾失效
+
+
+# ---------------- T10 评审 Minor（同笔提交） ----------------
+
+def test_pool_cap_exact_boundary_not_capped(populated, monkeypatch):
+    """恰好 POOL_CAP 条命中 → capped=False（LIMIT+1 探测消歧）。"""
+    import app.graph_query.search as s
+    monkeypatch.setattr(s, "POOL_CAP", 2)
+    out = search_graph_core(terms=["在线计费"])
+    # 正文恰 2 条命中（ADD URR 新版 + FEAT_BILLING），元数据另 1 条——均不触顶
+    assert out["total"] == 2
+    assert out["total_is_bounded"] is False
+    assert out["diagnostics"]["term_stats"]["在线计费"]["capped"] is False
+
+
+def test_zero_result_suggestion_mentions_skipped_short_terms(populated):
+    """零结果建议回显未搜正文的短词（T10 评审 Minor：短词跳正文可能是零结果主因）。"""
+    out = search_graph_core(terms=["配", "不存在的词xyz"])
+    assert out["total"] == 0
+    assert any("未搜正文" in s and "配" in s for s in out["suggestions"])
+
+
+def test_exact_name_outside_broad_pool_is_preserved_and_ranked_first(
+        tmp_data_dir, monkeypatch):
+    """宽包含池触顶时，精确名称不得因插入顺序落在池外而消失。"""
+    docs = {}
+    for i, name in enumerate(("needle alpha", "needle beta", "needle gamma")):
+        docs[f"broad-{i}.md"] = (
+            "---\n"
+            f"id: UDG@Feature@BROAD-{i}\n"
+            "type: Feature\n"
+            "version: 20.15.2\n"
+            f"name: {name}\n"
+            "---\n\nbody\n"
+        )
+    # 最后写入，保证旧实现的 LIMIT 2 任意池拿不到它。
+    docs["exact.md"] = (
+        "---\n"
+        "id: UDG@Feature@EXACT\n"
+        "type: Feature\n"
+        "version: 20.15.2\n"
+        "name: needle\n"
+        "---\n\nbody\n"
+    )
+    _setup(tmp_data_dir, monkeypatch, docs)
+    import app.graph_query.search as search_mod
+    monkeypatch.setattr(search_mod, "POOL_CAP", 2)
+
+    out = search_graph_core(terms=["needle"])
+
+    assert out["hits"][0]["id"] == "UDG@Feature@EXACT"
+    assert out["hits"][0]["rank_reasons"][0] == "名称精确匹配"
+    assert out["total_is_bounded"] is True
+
+
+def test_prefix_name_outside_contains_pool_is_preserved_and_ranked_first(
+        tmp_data_dir, monkeypatch):
+    """无精确项时，池外前缀项仍须优先于普通包含项。"""
+    docs = {}
+    for i, name in enumerate(("alpha needle", "beta needle", "gamma needle")):
+        docs[f"contains-{i}.md"] = (
+            "---\n"
+            f"id: UDG@Feature@CONTAINS-{i}\n"
+            "type: Feature\nversion: 20.15.2\n"
+            f"name: {name}\n"
+            "---\n\nbody\n"
+        )
+    docs["prefix.md"] = (
+        "---\n"
+        "id: UDG@Feature@PREFIX\n"
+        "type: Feature\nversion: 20.15.2\n"
+        "name: Needle target\n"
+        "---\n\nbody\n"
+    )
+    _setup(tmp_data_dir, monkeypatch, docs)
+    import app.graph_query.search as search_mod
+    monkeypatch.setattr(search_mod, "POOL_CAP", 2)
+
+    out = search_graph_core(terms=["NEEDLE"])
+
+    assert out["hits"][0]["id"] == "UDG@Feature@PREFIX"
+    assert out["hits"][0]["rank_reasons"][0] == "元数据前缀匹配"
+
+
+@pytest.mark.parametrize(("special_name", "term", "reason"), [
+    ("ＡＢＣ", "abc", "名称精确匹配"),
+    ("Straße", "STRASSE", "名称精确匹配"),
+    ("Ｓｔｒａße target", "strasse", "元数据前缀匹配"),
+])
+def test_normalized_priority_survives_pool_cap(
+        special_name, term, reason, tmp_data_dir, monkeypatch):
+    """Priority 沿用 NFKC+casefold，不能退化成 SQLite ASCII NOCASE。"""
+    norm = "strasse" if "tra" in term.casefold() else "abc"
+    docs = {
+        f"broad-{i}.md": (
+            "---\n"
+            f"id: UDG@Feature@NORM-BROAD-{i}\n"
+            "type: Feature\nversion: 20.15.2\n"
+            f"name: x {norm} {i}\n"
+            "---\n\nbody\n"
+        )
+        for i in range(3)
+    }
+    docs["special.md"] = (
+        "---\n"
+        "id: UDG@Feature@NORM-SPECIAL\n"
+        "type: Feature\nversion: 20.15.2\n"
+        f"name: {special_name}\n"
+        "---\n\nbody\n"
+    )
+    _setup(tmp_data_dir, monkeypatch, docs)
+    import app.graph_query.search as search_mod
+    monkeypatch.setattr(search_mod, "POOL_CAP", 2)
+
+    out = search_graph_core(terms=[term])
+
+    assert out["hits"][0]["id"] == "UDG@Feature@NORM-SPECIAL"
+    assert out["hits"][0]["rank_reasons"][0] == reason
+    assert out["total_is_bounded"] is True
+
+
+def test_three_plus_metadata_search_uses_fts_not_escaped_like(populated):
+    """>=3 字符元数据包含必须走 trigram MATCH，避免罕见多 term 全表 LIKE。"""
+    traced = []
+    populated.db.set_trace_callback(traced.append)
+    try:
+        search_graph_core(terms=["ADD URR", "AFUSRDETECT"], match="any")
+    finally:
+        populated.db.set_trace_callback(None)
+
+    selects = [sql.lower() for sql in traced if sql.lstrip().lower().startswith("select")]
+    assert any("metadata_text :" in sql and " match " in sql for sql in selects)
+    # priority 的行边界判断可用 LIKE，但必须由同一条 MATCH 先缩小候选；
+    # 禁止退回不带 MATCH 的元数据全表 LIKE。
+    metadata_like = [sql for sql in selects if "metadata_text like" in sql]
+    assert metadata_like and all(" match " in sql for sql in metadata_like)
+
+
+@pytest.mark.parametrize("term", ["配额", "配"])
+def test_skipped_short_term_relax_probe_never_scans_body_like(
+        populated, term):
+    """metadata_only 两字词及恒跳的一字词，零结果诊断也不能从后门扫正文。"""
+    populated.db.execute(
+        "INSERT INTO meta(key, value) VALUES('search_short_term_mode', "
+        "'metadata_only') ON CONFLICT(key) DO UPDATE SET value='metadata_only'")
+    populated.db.commit()
+    traced = []
+    populated.db.set_trace_callback(traced.append)
+    try:
+        out = search_graph_core(terms=[term], nf="UNC")
+    finally:
+        populated.db.set_trace_callback(None)
+
+    assert out["total"] == 0
+    assert not any("body_text like" in sql.lower() for sql in traced)

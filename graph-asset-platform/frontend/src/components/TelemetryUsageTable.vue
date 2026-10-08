@@ -2,7 +2,7 @@
   <section class="tut">
     <div class="tut-head">
       <h2 class="tut-title">调用底表</h2>
-      <span class="tut-hint">每次调用一行（REST /md、/domains + MCP 5 工具）；可切对象级细粒度</span>
+      <span class="tut-hint">每次 REST/MCP 图谱工具调用一行；可切对象级细粒度</span>
     </div>
 
     <div class="tut-bar">
@@ -80,9 +80,11 @@ const ENDPOINTS = [
   { value: '/md', label: 'POST /md' },
   { value: '/domains', label: 'POST /domains' },
   { value: '/search', label: 'POST /search' },
+  { value: '/files', label: 'POST /files' },
   { value: 'mcp:get_md', label: 'mcp:get_md' },
   { value: 'mcp:get_domains', label: 'mcp:get_domains' },
   { value: 'mcp:search_graph', label: 'mcp:search_graph' },
+  { value: 'mcp:search_files', label: 'mcp:search_files' },
   { value: 'mcp:search_objects', label: 'mcp:search_objects' },
   { value: 'mcp:search_md', label: 'mcp:search_md' },
   { value: 'mcp:get_object', label: 'mcp:get_object' },

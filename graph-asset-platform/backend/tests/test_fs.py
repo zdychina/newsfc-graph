@@ -102,6 +102,16 @@ def test_store_path_traversal_rejected(tmp_data_dir):
         store.move("a.md", "../escape.md")
 
 
+@pytest.mark.parametrize("path", [
+    "Command/bad:name.md", "Command/NUL.md", "Command/trailing. ",
+    "Command/control\x01.md",
+])
+def test_store_rejects_nonportable_windows_path_aliases(tmp_data_dir, path):
+    store = Store(tmp_data_dir)
+    with pytest.raises(ValueError):
+        store.write(path, "x")
+
+
 # ---------- frontmatter_rw ----------
 
 def test_rewrite_frontmatter_overrides():
@@ -177,6 +187,20 @@ def test_fs_put_rejects_id_change(tmp_data_dir, monkeypatch):
         assert r.status_code == 400
 
 
+def test_fs_put_new_file_registers_parent_directories(tmp_data_dir, monkeypatch):
+    """PUT 可新建文件；新建的多级父目录必须与文件同步入册。"""
+    s = _setup(tmp_data_dir, monkeypatch)
+    path = "Command/alpha/20.15.2/alpha@MMLCommand@ADD DEMO.md"
+    with TestClient(app) as c:
+        response = c.put(
+            "/api/v1/fs/file", params={"path": path}, json={"content": CMD})
+    assert response.status_code == 200, response.text
+    rows = {row["path"] for row in s.db.execute(
+        "SELECT path FROM files ORDER BY path")}
+    assert rows == {
+        "Command", "Command/alpha", "Command/alpha/20.15.2", path}
+
+
 # ---------- DELETE / mkdir ----------
 
 def test_fs_delete_cleans_empty_dirs(tmp_data_dir, monkeypatch):
@@ -188,6 +212,10 @@ def test_fs_delete_cleans_empty_dirs(tmp_data_dir, monkeypatch):
         assert c.delete("/api/v1/fs/file", params={"path": p}).status_code == 200
     assert not s.store.exists(p)
     assert not s.store.abspath("Command").exists()
+    assert s.db.execute(
+        "SELECT COUNT(*) FROM files WHERE path IN (?,?,?)",
+        ("Command", "Command/alpha", "Command/alpha/20.15.2"),
+    ).fetchone()[0] == 0
 
 
 def test_fs_delete_dir_recursive(tmp_data_dir, monkeypatch):
@@ -244,6 +272,71 @@ def test_fs_soft_delete_file_to_trash_and_restore(tmp_data_dir, monkeypatch):
     assert s.store.exists(p)
     assert s.index.resolve_node("alpha@MMLCommand@ADD DEMO", "20.15.2") is not None
     assert trash_repo.get(s.db, tid) is None
+
+
+def test_fs_restore_single_file_registers_recreated_parent_dirs(
+        tmp_data_dir, monkeypatch):
+    """单文件是目录中唯一内容时，删除会清空父目录；还原须把重建的目录也入册。"""
+    from app.file_query import search_files_core
+
+    s = _setup(tmp_data_dir, monkeypatch)
+    parent = "Command/alpha/20.15.2"
+    path = f"{parent}/alpha@MMLCommand@ADD DEMO.md"
+    s.store.write(path, CMD)
+    s.rebuild()
+
+    with TestClient(app) as c:
+        deleted = c.delete("/api/v1/fs/file", params={"path": path})
+        assert deleted.status_code == 200, deleted.text
+        restored = c.post(
+            "/api/v1/fs/trash/restore",
+            json={"id": deleted.json()["trash_id"]},
+        )
+        assert restored.status_code == 200, restored.text
+
+    parents = {row["path"] for row in s.db.execute(
+        "SELECT path FROM files WHERE is_dir=1")}
+    assert {"Command", "Command/alpha", parent} <= parents
+    listed = search_files_core(path=parent)
+    assert [item["path"] for item in listed["files"]] == [path]
+
+
+@pytest.mark.parametrize("request_path", [
+    r"Command\alpha\20.15.2\alpha@MMLCommand@ADD DEMO.md",
+    "Command/alpha/./20.15.2/alpha@MMLCommand@ADD DEMO.md",
+    "Command/alpha/temp/../20.15.2/alpha@MMLCommand@ADD DEMO.md",
+    r"C:\outside\alpha@MMLCommand@ADD DEMO.md",
+])
+def test_fs_write_path_variants_are_rejected_or_use_one_canonical_identity(
+        tmp_data_dir, monkeypatch, request_path):
+    """同一物理文件不得因 Windows 分隔符或点段产生 files/objects 双重身份。"""
+    from app.file_query import search_files_core
+
+    s = _setup(tmp_data_dir, monkeypatch)
+    canonical = "Command/alpha/20.15.2/alpha@MMLCommand@ADD DEMO.md"
+    with TestClient(app) as c:
+        response = c.put(
+            "/api/v1/fs/file", params={"path": request_path},
+            json={"content": CMD},
+        )
+
+    # API 可以选择严格拒绝非规范输入；一旦接受，就必须只留下规范路径身份。
+    if 400 <= response.status_code < 500:
+        assert s.db.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0
+        assert s.db.execute("SELECT COUNT(*) FROM objects").fetchone()[0] == 0
+        return
+    assert response.status_code == 200, response.text
+    file_paths = [row["path"] for row in s.db.execute(
+        "SELECT path FROM files WHERE is_dir=0")]
+    object_paths = [row["source_path"] for row in s.db.execute(
+        "SELECT source_path FROM objects")]
+    assert file_paths == [canonical]
+    assert object_paths == [canonical]
+
+    hit = search_files_core(query="ADD DEMO")["files"]
+    assert [(item["path"], item["obj_id"], item["version"])
+            for item in hit] == [
+        (canonical, "alpha@MMLCommand@ADD DEMO", "20.15.2")]
 
 
 def test_fs_soft_delete_dir_recursive_to_trash(tmp_data_dir, monkeypatch):
@@ -327,11 +420,25 @@ def test_fs_trash_empty(tmp_data_dir, monkeypatch):
 
 
 def test_fs_mkdir(tmp_data_dir, monkeypatch):
-    _setup(tmp_data_dir, monkeypatch)
+    s = _setup(tmp_data_dir, monkeypatch)
     with TestClient(app) as c:
         r = c.post("/api/v1/fs/mkdir", json={"path": "Feature/newnf/newver"})
         assert r.status_code == 200
     assert svc.get_service().store.abspath("Feature/newnf/newver").is_dir()
+    rows = {r["path"] for r in s.db.execute(
+        "SELECT path FROM files WHERE path IN (?,?,?)",
+        ("Feature", "Feature/newnf", "Feature/newnf/newver"),
+    )}
+    assert rows == {"Feature", "Feature/newnf", "Feature/newnf/newver"}
+
+
+@pytest.mark.parametrize("path", ["", "/", "\\"])
+def test_fs_mkdir_rejects_assets_root(path, tmp_data_dir, monkeypatch):
+    s = _setup(tmp_data_dir, monkeypatch)
+    with TestClient(app) as c:
+        r = c.post("/api/v1/fs/mkdir", json={"path": path})
+    assert r.status_code == 400
+    assert s.db.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0
 
 
 # ---------- move（target_dir 驱动）----------
@@ -348,6 +455,12 @@ def test_fs_move_to_target_dir(tmp_data_dir, monkeypatch):
     assert new_path == "Command/alpha/20.16.0/alpha@MMLCommand@ADD DEMO.md"
     assert s.store.exists(new_path)
     assert not s.store.exists(p)
+    rows = {r["path"] for r in s.db.execute(
+        "SELECT path FROM files WHERE path IN (?,?,?,?)",
+        ("Command", "Command/alpha", "Command/alpha/20.15.2",
+         "Command/alpha/20.16.0"),
+    )}
+    assert rows == {"Command", "Command/alpha", "Command/alpha/20.16.0"}
 
 
 def test_fs_move_with_fm_override(tmp_data_dir, monkeypatch):
@@ -379,6 +492,10 @@ def test_fs_rename_dry_run_and_apply(tmp_data_dir, monkeypatch):
     s.store.write(pa, a_md)
     s.store.write(pb, b_md)
     s.rebuild()
+    # 模拟历史漂移：文件在册，父目录行丢失。rename 应随目标补齐。
+    from app.repos import files_repo
+    files_repo.remove_path(s.db, "Command/alpha/20.15.2")
+    s.db.commit()
     with TestClient(app) as c:
         d = c.post("/api/v1/fs/rename",
                    json={"path": pa, "new_id": "alpha@MMLCommand@AAA2", "dry_run": True}).json()
@@ -395,6 +512,62 @@ def test_fs_rename_dry_run_and_apply(tmp_data_dir, monkeypatch):
     new_pa = "Command/alpha/20.15.2/alpha@MMLCommand@AAA2.md"
     assert s.store.exists(new_pa) and not s.store.exists(pa)
     assert parse_md(s.store.read(new_pa))[0]["id"] == "alpha@MMLCommand@AAA2"
+    # files 户口册：改名后新行在、旧行不在（rename 挂钩；rebuild 已灌两行）
+    assert s.db.execute(
+        "SELECT 1 FROM files WHERE path=?", (new_pa,)).fetchone() is not None
+    assert s.db.execute(
+        "SELECT 1 FROM files WHERE path=?", (pa,)).fetchone() is None
+    # 使现有册目缺目录行，rename 也应补齐目标父目录。
+    assert s.db.execute(
+        "SELECT 1 FROM files WHERE path=?", ("Command/alpha/20.15.2",)
+    ).fetchone() is not None
+
+
+@pytest.mark.parametrize("new_id", [
+    "../escape", "", "foo", "alpha@Feature@AAA", "beta@MMLCommand@AAA",
+])
+def test_fs_rename_rejects_invalid_target_before_rewriting_references(
+        tmp_data_dir, monkeypatch, new_id):
+    s = _setup(tmp_data_dir, monkeypatch)
+    src = "Command/alpha/20.15.2/alpha@MMLCommand@AAA.md"
+    ref = "Command/alpha/20.15.2/alpha@MMLCommand@BBB.md"
+    src_md = CMD.replace("alpha@MMLCommand@ADD DEMO",
+                         "alpha@MMLCommand@AAA")
+    original_ref = ("---\nid: alpha@MMLCommand@BBB\ntype: MMLCommand\n---\n"
+                    "[[alpha@MMLCommand@AAA]]\n")
+    s.store.write(src, src_md)
+    s.store.write(ref, original_ref)
+    s.rebuild()
+
+    with TestClient(app, raise_server_exceptions=False) as c:
+        response = c.post("/api/v1/fs/rename", json={
+            "path": src, "new_id": new_id, "dry_run": False})
+
+    assert response.status_code == 400
+    assert s.store.exists(src)
+    assert s.store.read(ref) == original_ref
+
+
+def test_fs_rename_rejects_existing_target_without_overwrite(
+        tmp_data_dir, monkeypatch):
+    s = _setup(tmp_data_dir, monkeypatch)
+    src = "Command/alpha/20.15.2/alpha@MMLCommand@AAA.md"
+    target = "Command/alpha/20.15.2/alpha@MMLCommand@BBB.md"
+    src_md = CMD.replace("alpha@MMLCommand@ADD DEMO",
+                         "alpha@MMLCommand@AAA")
+    target_md = CMD.replace("alpha@MMLCommand@ADD DEMO",
+                            "alpha@MMLCommand@BBB")
+    s.store.write(src, src_md)
+    s.store.write(target, target_md)
+    s.rebuild()
+
+    with TestClient(app) as c:
+        response = c.post("/api/v1/fs/rename", json={
+            "path": src, "new_id": "alpha@MMLCommand@BBB", "dry_run": False})
+
+    assert response.status_code == 409
+    assert s.store.read(src) == src_md
+    assert s.store.read(target) == target_md
 
 
 # ---------- upload（target_dir 驱动）----------
@@ -412,6 +585,12 @@ def test_fs_upload_to_target_dir(tmp_data_dir, monkeypatch):
     # 落到 target_dir/id.md（target_dir 权威，不经 classify）
     p = "Command/alpha/20.99.99/alpha@MMLCommand@UPLOAD.md"
     assert s.store.exists(p)
+    # files 户口册：上传文件行在册（upload 挂钩）
+    assert s.db.execute(
+        "SELECT 1 FROM files WHERE path=?", (p,)).fetchone() is not None
+    rows = {row["path"] for row in s.db.execute(
+        "SELECT path FROM files WHERE is_dir=1")}
+    assert rows == {"Command", "Command/alpha", "Command/alpha/20.99.99"}
 
 
 def test_fs_upload_overrides_fm(tmp_data_dir, monkeypatch):
@@ -451,6 +630,18 @@ def test_fs_upload_rejects_missing_id(tmp_data_dir, monkeypatch):
                       data={"target_dir": "Command/alpha/20.15.2"},
                       files={"files": ("bad.md", md, "text/markdown")}).json()
     assert body["skipped"] == 1 and body["added"] == 0
+
+
+def test_fs_upload_rejects_path_like_id_as_bad_request(tmp_data_dir, monkeypatch):
+    s = _setup(tmp_data_dir, monkeypatch)
+    bad = CMD.replace("alpha@MMLCommand@ADD DEMO", "../escape")
+    with TestClient(app, raise_server_exceptions=False) as c:
+        response = c.post(
+            "/api/v1/fs/upload", data={"target_dir": "Command/alpha/20.15.2"},
+            files={"files": ("bad.md", bad, "text/markdown")},
+        )
+    assert response.status_code == 400
+    assert s.db.execute("SELECT COUNT(*) FROM objects").fetchone()[0] == 0
 
 
 def test_fs_upload_wrong_layer_skipped(tmp_data_dir, monkeypatch):
@@ -520,3 +711,48 @@ def test_e2e_user_journey(tmp_data_dir, monkeypatch):
         pb = "Command/alpha/20.15.2/alpha@MMLCommand@BBB.md"
         assert c.delete("/api/v1/fs/file", params={"path": pb}).status_code == 200
         assert not s.store.exists(pb)
+
+
+# ---------- 写端点同步 files 户口册 ----------
+
+def test_fs_write_endpoints_sync_files(tmp_data_dir, monkeypatch):
+    """/fs 七个写端点各自同步 files 户口册（mkdir/put/move/delete/restore；upload/rename 由专项覆盖）。"""
+    s = _setup(tmp_data_dir, monkeypatch)
+    with TestClient(app) as c:
+        # mkdir → 目录行
+        r = c.post("/api/v1/fs/mkdir", json={"path": "Command/alpha/20.9.9"})
+        assert r.status_code == 200, r.text
+        row = s.db.execute(
+            "SELECT is_dir FROM files WHERE path='Command/alpha/20.9.9'").fetchone()
+        assert row is not None and row["is_dir"] == 1
+        # put_file → 文件行
+        r = c.put("/api/v1/fs/file",
+                  params={"path": "Command/alpha/20.9.9/t.md"},
+                  json={"content": CMD})
+        assert r.status_code == 200, r.text
+        assert s.db.execute(
+            "SELECT name FROM files WHERE path='Command/alpha/20.9.9/t.md'"
+        ).fetchone()["name"] == "t.md"
+        # move → 旧行消失、新行出现（move 后文件名 = id）
+        r = c.post("/api/v1/fs/move",
+                   json={"src": "Command/alpha/20.9.9/t.md",
+                         "target_dir": "Command/alpha/20.9.9/sub"})
+        assert r.status_code == 200, r.text
+        assert s.db.execute(
+            "SELECT 1 FROM files WHERE path='Command/alpha/20.9.9/t.md'"
+        ).fetchone() is None
+        assert s.db.execute(
+            "SELECT 1 FROM files WHERE path='Command/alpha/20.9.9/sub/"
+            "alpha@MMLCommand@ADD DEMO.md'").fetchone() is not None
+        # delete 目录 → 前缀行全清
+        r = c.delete("/api/v1/fs/file", params={"path": "Command/alpha/20.9.9"})
+        assert r.status_code == 200, r.text
+        assert s.db.execute(
+            "SELECT COUNT(*) FROM files WHERE path LIKE 'Command/alpha/20.9.9%'"
+        ).fetchone()[0] == 0
+        # 回收站还原 → 行回来
+        r = c.post("/api/v1/fs/trash/restore", json={"id": r.json()["trash_id"]})
+        assert r.status_code == 200, r.text
+        assert s.db.execute(
+            "SELECT COUNT(*) FROM files WHERE path LIKE 'Command/alpha/20.9.9%'"
+        ).fetchone()[0] > 0

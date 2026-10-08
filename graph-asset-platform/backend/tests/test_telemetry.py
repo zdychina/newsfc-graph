@@ -159,6 +159,33 @@ def test_aggregate_stats_call_level(tmp_path, monkeypatch):
     assert all(item["granularity"] == "day" for item in r["timeline"])
 
 
+def test_search_files_calls_appear_in_aggregate_and_call_details(
+        tmp_path, monkeypatch):
+    """REST /files 与 MCP search_files 都属于公开调用面，聚合和明细不得漏掉。"""
+    db = _use_tmp_telemetry(tmp_path, monkeypatch)
+    _seed(db, [
+        {"ts": _now(), "user": "rest-user", "caller": "skill",
+         "endpoint": "/files", "level": "tool"},
+        {"ts": _now(), "user": "mcp-user", "caller": "mcp",
+         "endpoint": "mcp:search_files", "level": "tool"},
+    ])
+    from app.telemetry.aggregator import (
+        aggregate_stats, list_skill_usage, list_usage_table)
+
+    stats = aggregate_stats(days=30)
+    assert stats["total"] == 2
+    assert stats["by_endpoint"] == {"/files": 1, "mcp:search_files": 1}
+
+    stream = list_skill_usage(limit=10, scope="call")
+    assert {event["endpoint"] for event in stream["events"]} == {
+        "/files", "mcp:search_files"}
+    table = list_usage_table(
+        scope="call", endpoints=("/files", "mcp:search_files"))
+    assert table["total"] == 2
+    assert {row["endpoint"] for row in table["rows"]} == {
+        "/files", "mcp:search_files"}
+
+
 def test_aggregate_stats_hour_granularity_short_window(tmp_path, monkeypatch):
     """时间窗 ≤2 天 → 按小时粒度。"""
     db = _use_tmp_telemetry(tmp_path, monkeypatch)

@@ -22,7 +22,7 @@ OBJECT_NOT_FOUND = "OBJECT_NOT_FOUND"
 VERSION_NOT_FOUND = "VERSION_NOT_FOUND"
 RESULT_TOO_LARGE = "RESULT_TOO_LARGE"
 INDEX_REBUILDING = "INDEX_REBUILDING"
-SEARCH_TOO_BROAD = "SEARCH_TOO_BROAD"
+SEARCH_TOO_BROAD = "SEARCH_TOO_BROAD"  # deprecated-unused（2026-09-29 超时治理退场，仅保留枚举兼容）
 TOOL_DISABLED = "TOOL_DISABLED"
 INTERNAL_ERROR = "INTERNAL_ERROR"
 
@@ -222,11 +222,24 @@ class SearchFacets(BaseModel):
     versions: dict[str, int]
 
 
+class TermCountStat(BaseModel):
+    """term_stats：hit=候选池内存在命中；capped=该词的候选池触顶。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    hit: bool
+    capped: bool
+
+
 class SearchDiagnostics(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    # 保留既有整数契约；旧调用方可继续直接执行 ``count > 0``。
     term_counts: dict[str, int]
+    term_stats: dict[str, TermCountStat]
     recovery_codes: list[str]
+    # 跳过正文搜索的短词展示值（Task 10 两档：1 字符恒跳 / 2 字符 metadata_only 档跳）
+    body_skipped_short_terms: list[str] = []
 
 
 class SearchGraphResponse(BaseModel):
@@ -238,6 +251,7 @@ class SearchGraphResponse(BaseModel):
     match: str
     applied_filters: dict
     total: int
+    total_is_bounded: bool = False
     page: int
     size: int
     has_more: bool
@@ -246,3 +260,54 @@ class SearchGraphResponse(BaseModel):
     facets: SearchFacets
     diagnostics: SearchDiagnostics
     suggestions: list[str]
+
+
+# ---------- search_files 输入/输出（spec 2026-09-29 §4.3） ----------
+
+# search_files 输入长度护栏（REST Field 与 core 校验同值引用，两通道不分叉；
+# 规范化后 query 上限 80 只在 core 用，留 file_query 本地）
+MAX_FILES_QUERY_LEN = 200     # query 原始输入
+MAX_FILES_PATH_LEN = 1024     # path 目录限定
+MAX_FILES_EXT_LEN = 64        # ext 扩展名
+MAX_FILES_AFTER_LEN = 1024    # after 游标（与 path 同值，独立常量便于演进）
+
+
+class RestFilesRequest(RestDomainsRequest):
+    """REST /files 请求体（与 MCP search_files 同契约）。query/path/ext 至少
+    一个（core 校验）；limit 1~500；after=游标（上一页 next_cursor）。长度上限
+    引上方 MAX_FILES_* 常量（core 同值校验，两通道不分叉）。"""
+
+    query: Optional[Annotated[str, Field(max_length=MAX_FILES_QUERY_LEN)]] = None
+    path: Optional[Annotated[str, Field(max_length=MAX_FILES_PATH_LEN)]] = None
+    ext: Optional[Annotated[str, Field(max_length=MAX_FILES_EXT_LEN)]] = None
+    recursive: bool = False
+    limit: int = Field(default=100, ge=1, le=500)
+    after: Optional[Annotated[str, Field(max_length=MAX_FILES_AFTER_LEN)]] = None
+
+
+class FileHit(BaseModel):
+    """文件行：目录行 is_dir=true、obj_id/version 为 null（键恒在——MCP 走
+    pydantic 补 null、REST 直接返回 dict，两边 wire 必须逐字节同构）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    name: str
+    ext: str
+    is_dir: bool
+    size: int
+    mtime: Optional[str] = None
+    obj_id: Optional[str] = None
+    version: Optional[str] = None
+
+
+class SearchFilesResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    files: list[FileHit]
+    total: int
+    total_is_bounded: bool
+    has_more: bool
+    next_cursor: Optional[str]
+    index_building: bool
+    applied_filters: dict

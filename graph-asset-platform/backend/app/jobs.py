@@ -127,6 +127,13 @@ def _is_busy(exc: BaseException) -> bool:
     )
 
 
+def _is_no_transaction(exc: BaseException) -> bool:
+    # 该错误仅可能来自 commit()（execute 自带提交检查），此时语句已被并发写者
+    # 连带提交落库；共享连接被回滚抢占的理论丢写场景由生产独立连接排除。
+    return isinstance(exc, sqlite3.OperationalError) and (
+        "no transaction" in str(exc).lower())
+
+
 def _rollback_quietly(db) -> None:
     try:
         db.rollback()
@@ -162,6 +169,11 @@ def _persist(j: ImportJob) -> None:
                 db.commit()
                 return
             except Exception as exc:  # sqlite 极端竞态曾逃逸 SystemError
+                if _is_no_transaction(exc):
+                    # 并发写者已抢先提交本连接事务（service._commit 同款竞态，
+                    # service.py:22 有完整论证）：语句已执行且已落库，按成功处理。
+                    # 测试共连接场景的窗口；生产独立连接不受影响。
+                    return
                 _rollback_quietly(db)
                 if _is_busy(exc) and attempt < attempts - 1:
                     time.sleep(_PERSIST_RETRY_DELAYS[attempt])

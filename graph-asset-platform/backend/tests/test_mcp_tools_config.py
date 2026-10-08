@@ -25,7 +25,7 @@ version: 20.15.2
 在线计费的使用量上报规则配置命令。
 """
 
-PUBLIC_TOOLS = {"get_domains", "get_md", "search_graph"}
+PUBLIC_TOOLS = {"get_domains", "get_md", "search_graph", "search_files"}
 LEGACY_TOOLS = {"search_objects", "search_md", "get_object"}
 ALL_TOOLS = PUBLIC_TOOLS | LEGACY_TOOLS
 
@@ -118,7 +118,8 @@ def test_get_config_permissions(tmp_data_dir, monkeypatch):
         assert all(t["supplemental_description"] == "" for t in body["tools"])
         assert all(t["default_description"] for t in body["tools"])
         assert body["instructions"] == ""
-        assert "三层电信图谱" in body["default_instructions"]
+        assert "配置知识图谱" in body["default_instructions"]
+        assert "三层电信图谱" not in body["default_instructions"]
         assert "决策树" in body["default_instructions"]
 
 
@@ -211,7 +212,74 @@ def test_instructions_supplement_semantics(tmp_data_dir, monkeypatch):
         # 清空 → 纯 canonical
         _patch_cfg(c, {"instructions": ""})
         assert "定制总体说明ABC" not in _init(c)["instructions"]
-        assert "三层电信图谱" in _init(c)["instructions"]
+        instructions = _init(c)["instructions"]
+        assert "配置知识图谱" in instructions
+        assert "三层电信图谱" not in instructions
+
+
+# ---------------- canonical 文案契约（上线审查 2026-10-08） ----------------
+
+def test_default_instructions_scope_latest_version_to_graph_objects(
+        tmp_data_dir, monkeypatch):
+    """“最新版本”只适用于图谱对象，不能让 Agent 误以为物理文件也被折叠。"""
+    _setup(tmp_data_dir, monkeypatch)
+    with _client() as c:
+        instructions = _init(c)["instructions"]
+
+    assert "所有搜索与读取默认作用于" not in instructions
+    assert "图谱对象" in instructions
+    assert "最新现存版本" in instructions
+    assert "search_files" in instructions
+    assert "磁盘" in instructions or "具体版本文件" in instructions
+
+
+def test_search_graph_description_does_not_redirect_bounded_body_results_to_files(
+        tmp_data_dir, monkeypatch):
+    """search_files 不搜正文，不能被描述成正文候选池截断后的“全量”出口。"""
+    _setup(tmp_data_dir, monkeypatch)
+    with _client() as c:
+        by_name = {tool["name"]: tool for tool in _tools_list(c)}
+    description = by_name["search_graph"]["description"]
+
+    assert "全量获取场景请用 search_files" not in description
+    assert "候选" in description
+    assert "不保证找全" in description or "截断" in description
+
+
+def test_legacy_default_descriptions_mark_deprecation_and_replacement(
+        tmp_data_dir, monkeypatch):
+    """旧工具即使被管理员重新设为 visible，也必须先告诉 Agent 替代工具。"""
+    _setup(tmp_data_dir, monkeypatch)
+    with _client() as c:
+        body = _get_cfg(c).json()
+    descriptions = {tool["name"]: tool["default_description"]
+                    for tool in body["tools"]}
+
+    replacements = {
+        "search_objects": "search_graph",
+        "search_md": "search_graph",
+        "get_object": "get_md",
+    }
+    for legacy, replacement in replacements.items():
+        description = descriptions[legacy]
+        assert "deprecated" in description.lower() or "已废弃" in description
+        assert replacement in description
+
+
+def test_search_files_description_states_normalized_limit_and_empty_path_rule(
+        tmp_data_dir, monkeypatch):
+    """把实现边界写进 Agent 可见契约：规范化后 80 字，空 path 不是根目录。"""
+    _setup(tmp_data_dir, monkeypatch)
+    with _client() as c:
+        search_files = next(
+            tool for tool in _tools_list(c) if tool["name"] == "search_files")
+
+    query_description = search_files["inputSchema"]["properties"]["query"]["description"]
+    combined = search_files["description"] + "\n" + query_description
+    assert "规范化后" in combined
+    assert "80" in combined
+    assert "空 path" in combined or "path=''" in combined or 'path=""' in combined
+    assert "根目录" in combined
 
 
 def test_instructions_survive_restart(tmp_data_dir, monkeypatch):

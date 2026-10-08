@@ -503,6 +503,38 @@ def test_reconcile_completed_stale_apply_marks_done(env, monkeypatch):
     assert jobs_mod.pending_for("product_doc_mine") is None
 
 
+def test_reconcile_completed_stale_apply_repairs_files_catalog_before_done(
+        env, monkeypatch):
+    """崩在对象索引完成、files 户口未写之间时，对账须先补册再确认 done。"""
+    from app import jobs as jobs_mod
+    from app.service import get_service
+
+    confirmed = _confirmed_task(env, monkeypatch)
+    svc = get_service()
+    manifest = _rows(confirmed.job_id)
+    assert manifest
+
+    # 模拟 apply 在 files_repo 同步之前崩溃：资产、objects/FTS/清单均已完成，户口为空。
+    for table in ("files", "files_fts", "files_fts_map"):
+        svc.db.execute(f"DELETE FROM {table}")
+    result = dict(jobs_mod.get_job(confirmed.job_id).result)
+    jobs_mod.update_job(
+        confirmed.job_id, status="processing",
+        result={**result, "stage": "applying"}, added=0, finished_at=0,
+    )
+    jobs_mod._registry.clear()
+
+    assert gate.reconcile_interrupted() >= 1
+    restored = jobs_mod.get_job(confirmed.job_id)
+    assert restored.status == "done"
+    catalog_paths = {row["path"] for row in svc.db.execute(
+        "SELECT path FROM files")}
+    manifest_paths = {row["path"] for row in manifest}
+    assert manifest_paths <= catalog_paths
+    assert all("/".join(path.split("/")[:-1]) in catalog_paths
+               for path in manifest_paths)
+
+
 def test_get_job_is_read_only_for_stale_apply(env, monkeypatch):
     """GET 任务轮询必须无写副作用，不得隐式执行孤儿清扫/终止 PID。"""
     from app import jobs as jobs_mod
@@ -610,6 +642,14 @@ def test_cancel_after_applied_state_reindexes_rollback(env, monkeypatch, tmp_dat
     assert service.index.node("UDG@MMLCommand@ADD NEW", "20.15.2") is None
     assert service.index.node("UDG@MMLCommand@MOD ME", "20.15.2") is not None
     assert fts_repo.integrity_ok(service.db)
+    # files 户口册随 cancel 收敛（modify 行在 / add+sidecar 行无 / 三表一致）
+    from app.repos import files_repo
+    have = {r["path"] for r in service.db.execute(
+        "SELECT path FROM files").fetchall()}
+    assert any(p.endswith("MOD ME.md") for p in have)
+    assert not any(p.endswith("ADD NEW.md") for p in have)
+    assert not any("_build_manifest" in p for p in have)
+    assert files_repo.integrity_ok(service.db)
 
 
 def test_cancel_retry_reconciles_full_manifest_after_index_failure(
@@ -668,6 +708,15 @@ def test_cancel_after_partial_apply_rolls_back_files(env, monkeypatch, tmp_data_
     assert not (tmp_data_dir / "Command/UDG/20.15.2/_build_manifest.json").exists()
     assert _rows(j.job_id) == []
     assert _get_job(j.job_id)["status"] == "cancelled"
+    # files 户口册随 cancel 收敛：部分落盘回滚后 add/sidecar 行清、modify 行在
+    from app import db as dbmod
+    from app.repos import files_repo
+    db = dbmod.get_shared_db()
+    have = {r["path"] for r in db.execute("SELECT path FROM files").fetchall()}
+    assert any(p.endswith("MOD ME.md") for p in have)
+    assert not any(p.endswith("ADD NEW.md") for p in have)
+    assert not any("_build_manifest" in p for p in have)
+    assert files_repo.integrity_ok(db)
 
 
 # ---------- feature：依赖（直调层）+ 自动重跑 ----------
@@ -962,3 +1011,44 @@ def test_multi_mml_dirs_single_invocation_into_sandbox(env, monkeypatch):
     assert str(cmd_call["storage"]).startswith(str(gate.gate_storage(j.job_id)))
     # 产物在沙箱的 AMF 槽位（目标≠包名解耦核心）
     assert (gate.gate_storage(j.job_id) / "Command/AMF/20.15.2/_build_manifest.json").exists()
+
+
+# ---------- files 户口册同步（spec §4.2，apply/cancel/revert 三流） ----------
+
+def test_gate_apply_and_revert_sync_files(env, monkeypatch, tmp_data_dir):
+    fake = env.stub_cmd(extra_binary=True)
+    j = env.start(monkeypatch, fake)
+    assert j.status == "awaiting", j.error
+    r = client.post(f"/api/v1/import/extract/{j.job_id}/confirm",
+                    json={"action": "overwrite"})
+    assert r.status_code == 200, r.text
+    j2 = _get_job(j.job_id)
+    assert j2["status"] == "done"
+    from app import db as dbmod
+    db = dbmod.get_shared_db()
+    have = {row["path"] for row in db.execute("SELECT path FROM files").fetchall()}
+    # 清单内全部文件（含 _build_manifest sidecar 与 assets/pic.png 二进制）入册
+    for row in _rows(j.job_id):
+        assert row["path"] in have
+    # 父目录行入册（path 直接子项浏览可见新文件；批量 API 的 parents 调用）
+    dir_row = db.execute(
+        "SELECT is_dir FROM files WHERE path='Command/UDG/20.15.2'").fetchone()
+    assert dir_row is not None and dir_row["is_dir"] == 1
+    assert "Command/UDG/20.15.2/assets" in have  # apply 新建的目录（extra_binary）
+    # revert：add → 软删/物理删（行消失）；modify → 还原旧版（行保留）
+    from app.pipeline import gate as gate_mod
+    gate_mod.revert_job(j.job_id, deleted_by="tester")
+    have2 = {row["path"] for row in db.execute("SELECT path FROM files").fetchall()}
+    assert not any(p.endswith("ADD NEW.md") for p in have2)
+    assert not any("_build_manifest" in p for p in have2)
+    assert any(p.endswith("MOD ME.md") for p in have2)
+    # ①MOD ME 行的 size/mtime 已随还原旧版刷新（与磁盘 stat 一致）
+    mod_rel = "Command/UDG/20.15.2/UDG@MMLCommand@MOD ME.md"
+    mod_row = db.execute("SELECT size, mtime FROM files WHERE path=?",
+                         (mod_rel,)).fetchone()
+    st = (tmp_data_dir / mod_rel).stat()
+    assert mod_row["size"] == st.st_size
+    assert mod_row["mtime"] == pytest.approx(st.st_mtime)
+    # ②三表一致（files / files_fts / files_fts_map）
+    from app.repos import files_repo
+    assert files_repo.integrity_ok(db)

@@ -213,3 +213,29 @@ def test_rest_attribution_matches_mcp_telemetry(tmp_data_dir, monkeypatch):
     assert stats["total"] == 2
     assert stats["by_operator"] == {ATTRIBUTION["AGENT_USERNAME"]: 2}
     assert stats["by_session"] == 1
+
+
+# ---------------- /files（2026-09-29，与 MCP search_files 同构） ----------------
+
+def test_files_query_with_obj_link(tmp_data_dir, monkeypatch):
+    _seed(tmp_data_dir, monkeypatch)
+    r = client.post("/api/v1/files", json={**ATTRIBUTION, "query": "ADD DEMO"})
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["total"] == 2  # 20.15.2 + 20.16.0 两份文件
+    by_ver = {f["version"]: f for f in out["files"]}
+    assert by_ver["20.15.2"]["obj_id"] == "alpha@MMLCommand@ADD DEMO"
+
+
+def test_files_ls_and_validation_errors(tmp_data_dir, monkeypatch):
+    _seed(tmp_data_dir, monkeypatch)
+    r = client.post("/api/v1/files", json={**ATTRIBUTION, "path": "Command"})
+    assert r.status_code == 200, r.text
+    assert [f["name"] for f in r.json()["files"]] == ["alpha"]  # ls：目录行
+    r2 = client.post("/api/v1/files", json=ATTRIBUTION)  # 无过滤
+    assert r2.status_code == 422
+    assert r2.json()["error"]["code"] == "INVALID_ARGUMENT"
+    r3 = client.post("/api/v1/files",
+                     json={**ATTRIBUTION, "path": "NoSuchDir"})
+    assert r3.status_code == 422
+    assert r3.json()["error"]["code"] == "INVALID_FILTER"

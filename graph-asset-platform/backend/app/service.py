@@ -13,7 +13,7 @@ from .config import ASSETS_DIR
 from .db import get_shared_db
 from .index import Index
 from .registry import Registry
-from .store import Store
+from .store import Store, normalize_relpath
 
 # 模块级写锁：写盘 + DB UPSERT + reload 内存必须串行化（单例跨线程共享）。
 import_lock = threading.Lock()
@@ -39,6 +39,8 @@ def _commit(db) -> None:
 
 
 class Service:
+    _files_rebuild_state_lock = threading.Lock()
+
     def __init__(self):
         self.store = Store(ASSETS_DIR)
         self.registry = Registry.load_default()
@@ -60,6 +62,19 @@ class Service:
             import threading as _t
             _t.Thread(target=self._fts_reconcile_async, daemon=True).start()
             _t.Thread(target=self._sync_mtime_async, daemon=True).start()
+        # files 户口册首启 bootstrap（v14）：无 files_bootstrapped 完成标记 → 后台
+        # 建册。标记只在 rebuild 成功后同锁写入：表空、或进程被杀留半截册（表非空
+        # 但无标记）都会重跑。flag 先置位再起线程（spec：防构造与线程启动之间的
+        # 请求窗口看到空表 + false）。assets 为空时建出 0 行册并写标记，等价于
+        # spec 的「assets 非空」守卫（无害偏差）。
+        self._files_rebuild_active = 0
+        self.files_building = False
+        if not self.db.execute(
+            "SELECT value FROM meta WHERE key='files_bootstrapped'"
+        ).fetchone():
+            self.files_building = True
+            threading.Thread(target=self._files_bootstrap_async,
+                             daemon=True).start()
 
     def _fts_reconcile_async(self) -> None:
         """后台对账三张派生表：md_fts（legacy）+ graph_search_fts + object_latest。
@@ -100,6 +115,18 @@ class Service:
         except Exception:  # noqa: BLE001 后台线程绝不抛
             pass
 
+    def _files_bootstrap_async(self) -> None:
+        """后台一次性建 files 册（无完成标记时；百万级为分钟级，不阻塞启动）。
+        成功走 ``rebuild_files``（锁内建册 + 写 files_bootstrapped 标记 + 期间置
+        files_building）。失败清理由 ``rebuild_files`` 统一保证；本后台
+        入口只记录异常，不向线程外抛出。"""
+        try:
+            n = self.rebuild_files()
+            print(f"[startup] files 户口册首启建册 {n} 行", flush=True)
+        except Exception as e:  # noqa: BLE001 后台线程绝不抛
+            print(f"[startup] files 建册失败（已清残册，下次启动自动重试；admin 可经 /admin/files-reindex 手动触发）: {e!r}",
+                  flush=True)
+
     def _table_empty(self, name: str) -> bool:
         return self.db.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0] == 0
 
@@ -136,6 +163,10 @@ class Service:
     def reload_index(self) -> None:
         """从 DB 重载内存 Index（写操作末尾调用）。"""
         self.index = Index.load_from_db(self.db, self.registry)
+        # catalog 目录值缓存失效（函数级 import 防环：catalog 顶层 import 了
+        # 本模块的 get_service）。写路径末尾统一走这里 → 目录值随之失效。
+        from .graph_query import catalog as _catalog
+        _catalog.invalidate()
 
     def reindex_path(self, rel: str, *, commit: bool = True) -> None:
         """单文件 parse → UPSERT DB（objects/edges/双 FTS/object_latest）。
@@ -145,6 +176,7 @@ class Service:
         按 ``old_ids ∪ new_ids`` 刷新（v12 统一搜索，§12.1）——刷新在未提交事务
         内执行，不产生额外 commit（reindex_paths 的分块节奏不受影响）。
         """
+        rel = normalize_relpath(rel, allow_root=False)
         from .edges import parse_edges
         from .logical_id import split_id
         from .md_parser import parse_md
@@ -238,7 +270,8 @@ class Service:
         每 ``chunk_size`` 个文件提交一次，既避免逐文件事务，也不长时间
         饿死 jobs/telemetry 的独立 SQLite 写者。
         """
-        unique = sorted({str(path).replace("\\", "/") for path in paths
+        unique = sorted({normalize_relpath(str(path), allow_root=False)
+                         for path in paths
                          if str(path).lower().endswith(".md")})
         if not unique:
             return {"indexed": 0, "removed": 0}
@@ -275,8 +308,8 @@ class Service:
         prefixes 如 ``["Command/UDG/20.15.2", "Feature/UDG/20.15.2"]``；
         **调用方须持 import_lock**（与 fs 写端点一致）。返回 {"indexed", "removed"}。
         """
-        normalized = sorted({p.strip().strip("/") for p in prefixes
-                             if p and p.strip(" / ")})
+        normalized = sorted({normalize_relpath(p, allow_root=False)
+                             for p in prefixes if p and p.strip(" / ")})
         if not normalized:
             return {"indexed": 0, "removed": 0}
         disk = sorted({rel for prefix in normalized
@@ -306,11 +339,65 @@ class Service:
         return self.reindex_paths([*changed, *deleted])
 
     def rebuild(self) -> None:
-        """全量 reindex 兜底：扫 md 重建 DB + 内存（手动触发，慢；用于数据不一致时）。"""
+        """全量 reindex 兜底：扫 md 重建 DB + 内存 + files 户口册（手动触发，慢）。
+
+        files 部分走 ``rebuild_files``（自带锁 + 标记 + files_building），故与
+        build_index_db 分两段持锁——import_lock 非重入锁，rebuild_files 不得在
+        本方法已持锁时调用。"""
         from .migrate import build_index_db
         with import_lock:
             build_index_db(self.db, self.store, self.registry)
             self.index = Index.load_from_db(self.db, self.registry)
+            from .graph_query import catalog as _catalog
+            _catalog.invalidate()  # 全量重建后目录值必变——锁内末尾失效
+        self.rebuild_files()
+
+    def rebuild_files(self) -> int:
+        """全量重建 files 册（admin 端点 / rebuild / bootstrap 三处统一）：
+        锁内 rebuild_all + 写 files_bootstrapped 标记，期间置 files_building。
+        返回入册行数（文件+目录）。自带 import_lock——调用方不得已持锁（非重入）。"""
+        from .repos import files_repo
+        n = 0
+        succeeded = False
+        with self._files_rebuild_state_lock:
+            self._files_rebuild_active = \
+                getattr(self, "_files_rebuild_active", 0) + 1
+            self.files_building = True
+        try:
+            with import_lock:
+                try:
+                    # 先持久化撤销完成标记：即使进程在分块重建
+                    # 中被杀，下次启动也会自动重试，不会误认半册已就绪。
+                    self.db.execute(
+                        "DELETE FROM meta WHERE key=?", ("files_bootstrapped",))
+                    _commit(self.db)
+                    n = files_repo.rebuild_all(self.db, self.store)
+                    self.db.execute(
+                        "INSERT INTO meta(key, value) VALUES(?, ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        ("files_bootstrapped", "1"))
+                    _commit(self.db)
+                    succeeded = True
+                except Exception:
+                    # rebuild_all 分块提交，因此 rollback 不足以清除半册。
+                    # 失败时显式清理三表与 marker，保证不暴露静默残缺结果。
+                    self.db.rollback()
+                    self.db.execute("DELETE FROM files")
+                    self.db.execute("DELETE FROM files_fts")
+                    self.db.execute("DELETE FROM files_fts_map")
+                    self.db.execute(
+                        "DELETE FROM meta WHERE key=?", ("files_bootstrapped",))
+                    _commit(self.db)
+                    raise
+            return n
+        finally:
+            with self._files_rebuild_state_lock:
+                active = max(
+                    0, getattr(self, "_files_rebuild_active", 1) - 1)
+                self._files_rebuild_active = active
+                # 还有排队/执行中的 rebuild，或本次失败无 marker，
+                # 都不得向 search_files 宣告索引已就绪。
+                self.files_building = active > 0 or not succeeded
 
     # ---------- 正文全文搜索（MCP search_md 的 service 层实现） ----------
 

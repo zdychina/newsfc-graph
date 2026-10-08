@@ -1,8 +1,40 @@
 import shutil
 import uuid
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from .config import win_long as _win_long  # 超长路径（>260）fs 操作 helper
+
+_WINDOWS_FORBIDDEN = frozenset('<>:"|?*')
+_WINDOWS_RESERVED = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
+def normalize_relpath(rel: str, *, allow_root: bool = True) -> str:
+    """规范 assets 相对路径，并拒绝会产生多重身份的点段。"""
+    if not isinstance(rel, str):
+        raise ValueError("路径必须是字符串")
+    raw = rel.replace("\\", "/")
+    if raw.startswith("/") or PureWindowsPath(raw).drive:
+        raise ValueError(f"非法路径（绝对路径）: {rel}")
+    parts = raw.split("/")
+    if any(part in (".", "..") for part in parts):
+        raise ValueError(f"非法路径（不允许 . 或 .. 路径段）: {rel}")
+    nonempty = [part for part in parts if part]
+    for part in nonempty:
+        if (any(ord(ch) < 32 for ch in part)
+                or any(ch in _WINDOWS_FORBIDDEN for ch in part)):
+            raise ValueError(f"非法路径字符: {rel}")
+        if part.endswith((" ", ".")):
+            raise ValueError(f"非法路径（名称不能以空格或点结尾）: {rel}")
+        if part.split(".", 1)[0].upper() in _WINDOWS_RESERVED:
+            raise ValueError(f"非法路径（Windows 保留名称）: {rel}")
+    normalized = "/".join(nonempty)
+    if not normalized and not allow_root:
+        raise ValueError("路径不能为空")
+    return normalized
 
 
 class Store:
@@ -28,10 +60,7 @@ class Store:
 
     def _resolve(self, rel: str) -> Path:
         """把相对路径解析为绝对路径，并校验未逃逸 assets 根。"""
-        rel_path = rel.replace("\\", "/")
-        # 严格禁止绝对路径与盘符写法（Windows 下 "C:\\..." 会被 Path 拼接覆盖根）
-        if rel_path.startswith("/"):
-            raise ValueError(f"非法路径（绝对路径）: {rel}")
+        rel_path = normalize_relpath(rel)
         # pathlib 的 join 对含 .. 的路径会原样拼接；用 os.path.normpath 思路：直接 resolve 后比对祖先
         p = (self.root / rel_path).resolve()
         root = self._root_resolved

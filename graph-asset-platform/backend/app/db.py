@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .config import DB_PATH
 
-SCHEMA_VERSION = "13"
+SCHEMA_VERSION = "14"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS objects(
@@ -318,6 +318,31 @@ CREATE TABLE IF NOT EXISTS graph_search_map(
 -- 搜索过滤索引（§12.2，EXPLAIN 驱动不过度堆索引）
 CREATE INDEX IF NOT EXISTS idx_objects_nf_type_version ON objects(nf, type, version);
 CREATE INDEX IF NOT EXISTS idx_objects_domain_scenario ON objects(domain, scenario);
+
+-- ============ 文件户口册（v14，search_files 2026-09-29 spec §4.1）============
+-- assets 下所有文件 + 目录行（目录行支撑 path 模式 ls 式直接子项浏览）。
+-- files_fts.name 存规范化文件名（NFKC→strip→casefold，复用 graph_search_repo
+-- 的 normalize_search_text）；files.name 存原样（响应展示）。伴生 map 同
+-- md_fts_map/graph_search_map 教训：按 rowid O(1) 删，防批量维护 O(N²)。
+CREATE TABLE IF NOT EXISTS files(
+  path TEXT PRIMARY KEY,          -- 相对 assets 根，正斜杠，磁盘真实大小写
+  name TEXT NOT NULL,
+  ext  TEXT NOT NULL DEFAULT '',  -- 小写无点；目录恒 ''
+  is_dir INTEGER NOT NULL DEFAULT 0,
+  size INTEGER NOT NULL DEFAULT 0,   -- 目录恒 0
+  mtime REAL NOT NULL DEFAULT 0      -- 目录不随子项变更刷新（仅展示，避免噪音）
+) WITHOUT ROWID;
+
+-- ext-only / ext+after 游标检索：等值列在前、path 范围与排序在后。
+CREATE INDEX IF NOT EXISTS idx_files_ext_path ON files(ext, path);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
+  path UNINDEXED, name, tokenize='trigram'
+);
+
+CREATE TABLE IF NOT EXISTS files_fts_map(
+  path TEXT PRIMARY KEY, fts_rowid INTEGER NOT NULL
+) WITHOUT ROWID;
 """
 
 

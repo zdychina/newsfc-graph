@@ -127,8 +127,8 @@ def test_mcp_403_without_skill_perm(tmp_data_dir, monkeypatch):
 
 # ---------------- 协议 ----------------
 
-def test_tools_list_returns_3_public_tools(tmp_data_dir, monkeypatch):
-    """v13 三态迁移后 tools/list 只展示 get_domains/search_graph/get_md（§15.4）。"""
+def test_tools_list_returns_4_public_tools(tmp_data_dir, monkeypatch):
+    """v13 三态迁移后 tools/list 只展示公开工具（search_files 注册后 4 个，§15.4）。"""
     _setup(tmp_data_dir, monkeypatch)
     with _client() as c:
         r = c.post("/mcp", headers={"X-API-Key": "gap_admin", **ACC},
@@ -136,7 +136,7 @@ def test_tools_list_returns_3_public_tools(tmp_data_dir, monkeypatch):
         assert r.status_code == 200
         tools = r.json()["result"]["tools"]
         names = {t["name"] for t in tools}
-        assert names == {"get_domains", "get_md", "search_graph"}
+        assert names == {"get_domains", "get_md", "search_graph", "search_files"}
         by = {t["name"]: t for t in tools}
         # 上下文参数必填（required）且 description 指向沙箱环境变量
         get_md = by["get_md"]
@@ -169,6 +169,15 @@ def test_tools_list_returns_3_public_tools(tmp_data_dir, monkeypatch):
         assert "anyOf" in ap or "oneOf" in ap or "$ref" in ap
         # ids 护栏进 schema
         assert get_md["inputSchema"]["properties"]["ids"]["maxItems"] == 100
+        sf = by["search_files"]["inputSchema"]["properties"]
+        def _max_length(spec):
+            return spec.get("maxLength") or next(
+                (branch.get("maxLength") for branch in spec.get("anyOf", [])
+                 if branch.get("maxLength")), None)
+        assert _max_length(sf["query"]) == 200
+        assert _max_length(sf["path"]) == 1024
+        assert _max_length(sf["ext"]) == 64
+        assert _max_length(sf["after"]) == 1024
 
 
 def test_hidden_legacy_still_callable_with_old_shape(tmp_data_dir, monkeypatch):
@@ -405,3 +414,36 @@ def test_tool_row_records_error_result(tmp_data_dir, monkeypatch):
     result = json.loads(rows[0]["result"])
     assert result["error"]["code"] == "RESULT_TOO_LARGE"
     assert json.loads(rows[0]["params"])["ids"] == ["UDG@MMLCommand@ADD URR"]
+
+
+# ---------------- search_files（2026-09-29） ----------------
+
+def test_mcp_search_files_query(tmp_data_dir, monkeypatch):
+    _setup(tmp_data_dir, monkeypatch, files={"cmd.md": CMD, "feat.md": FEATURE})
+    with _client() as c:
+        out = _call(c, "search_files", {**_CTX, "query": "ADD URR"})
+    assert out["total"] == 1
+    hit = out["files"][0]
+    assert hit["obj_id"] == "UDG@MMLCommand@ADD URR"
+    assert hit["version"] == "20.15.2"
+    assert out["index_building"] is False
+
+
+def test_mcp_search_files_ls_mode(tmp_data_dir, monkeypatch):
+    _setup(tmp_data_dir, monkeypatch, files={"cmd.md": CMD})
+    with _client() as c:
+        out = _call(c, "search_files", {**_CTX, "path": "Command"})
+    assert [(f["name"], f["is_dir"], f["obj_id"]) for f in out["files"]] == \
+        [("UDG", True, None)]
+
+
+def test_mcp_search_files_errors(tmp_data_dir, monkeypatch):
+    _setup(tmp_data_dir, monkeypatch, files={"cmd.md": CMD})
+    with _client() as c:
+        err1 = json.loads(_call_err(c, "search_files", {**_CTX}))
+        err2 = json.loads(_call_err(c, "search_files", {**_CTX, "query": "x"}))
+        err3 = json.loads(_call_err(
+            c, "search_files", {**_CTX, "query": "ADD URR", "typo": 1}))
+    assert err1["error"]["code"] == "INVALID_ARGUMENT"   # 无过滤
+    assert err2["error"]["code"] == "INVALID_ARGUMENT"   # 1 字符
+    assert err3["error"]["code"] == "INVALID_ARGUMENT"   # 未知参数拦截

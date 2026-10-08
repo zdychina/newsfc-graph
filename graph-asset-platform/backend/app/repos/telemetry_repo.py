@@ -18,7 +18,7 @@ _STATS_ENDPOINTS = ("/md", "/domains", "mcp:get_md", "mcp:get_domains")
 _STATS_CALLERS = ("skill", "mcp")
 # 底表口径（2026-09-04 用户重定）：
 # - call（默认）：**调用级**——每次调用一行。REST /md、/domains 各 1 行
-#   （level=tool，含 params/result）+ MCP 5 工具每调用 1 行（level=tool）。
+#   （level=tool，含 params/result）+ MCP 图谱工具每调用 1 行（level=tool）。
 # - object：**对象级**细粒度——每取一个对象一行（get_md/get_domains/REST，
 #   level=object），供单独导出；运维页统计热榜同此数据源。
 # - all：两类全含。
@@ -26,8 +26,9 @@ _STATS_CALLERS = ("skill", "mcp")
 # v12（2026-09-08 三工具重构）：新增 mcp:search_graph；legacy 三端点保留
 # （历史数据与兼容期直调继续进统计/底表，§13.2）。
 # 2026-09-09：搜索补 REST 通道（POST /search）。
-_CALL_ENDPOINTS = ("/md", "/domains", "/search",
+_CALL_ENDPOINTS = ("/md", "/domains", "/search", "/files",
                    "mcp:get_md", "mcp:get_domains", "mcp:search_graph",
+                   "mcp:search_files",
                    "mcp:search_objects", "mcp:search_md", "mcp:get_object")
 _SCOPE_LEVELS = {"call": ("tool",), "object": ("object",),
                  "all": ("object", "tool")}
@@ -63,7 +64,7 @@ def _norm_bound(t: str, *, is_end: bool) -> str:
 def aggregate_stats(conn: sqlite3.Connection, days: int = 30,
                     start: str = "", end: str = "") -> dict:
     """**调用级**聚合（2026-09-04 用户重定）：level=tool + caller∈{skill,mcp} +
-    endpoint∈全暴露面 7 端点（REST /md、/domains + MCP 5 工具）。
+    endpoint∈全部已登记的 REST/MCP 图谱调用端点。
     一次 REST /md（不管带几个 id）= 1 次调用；一次 MCP 工具调用 = 1 次。
 
     返回：total=累计调用次数；by_endpoint=按端点计数；top_users=最活跃用户 TOP10
@@ -80,7 +81,9 @@ def aggregate_stats(conn: sqlite3.Connection, days: int = 30,
     params = [*list(_STATS_CALLERS), *list(_CALL_ENDPOINTS)]
     start = _norm_bound(start, is_end=False)
     end = _norm_bound(end, is_end=True)
-    c = start if start else _cutoff_iso(days)
+    # 任一显式时间边界都优先于“近 N 天”：只给 end 表示从最早记录到该日，
+    # 不能再偷偷叠加默认 30 天下界（否则测试/查询会随当前日期漂移）。
+    c = start if start else (None if end else _cutoff_iso(days))
     if c:
         sql += " AND ts >= ?"
         params.append(c)
@@ -194,7 +197,7 @@ def list_skill_usage(conn: sqlite3.Connection, since: str = "", limit: int = 100
 
     scope（2026-09-04 用户重定）：
       - ``call``（默认）：**调用级**——REST /md、/domains 每请求 1 行 +
-        MCP 5 工具每调用 1 行（level=tool，含 params/result）；
+        MCP 图谱工具每调用 1 行（level=tool，含 params/result）；
       - ``object``：**对象级**细粒度——每取一个对象 1 行（level=object，4 端点）；
       - ``all``：两类全含。
     每行显式带 caller（skill/mcp）。游标语义（next_since 不透明，原样回传）：

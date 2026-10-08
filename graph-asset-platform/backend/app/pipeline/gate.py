@@ -247,7 +247,7 @@ def apply_gate(job_id: str, action: str) -> dict:
 
 def _apply_gate_locked(job_id: str, action: str) -> dict:
     """``apply_gate`` 的临界区实现；调用方已经持有 ``import_lock``。"""
-    from ..repos import extract_files_repo
+    from ..repos import extract_files_repo, files_repo
     from ..service import get_service
     svc = get_service()
     j = jobs.get_job(job_id)
@@ -331,6 +331,11 @@ def _apply_gate_locked(job_id: str, action: str) -> dict:
     # ConfigObject/Feature 前缀。索引失败必须保持 awaiting 可重试，
     # 不得带告警假装 done。
     ix = svc.reindex_paths(rows_map.keys())
+    # files 户口册同步（spec §4.2）：按清单行集合自愈式同步（存在→stat 入册，
+    # 不存在→删行）。须在耐久完成点 update_job(done) 之前——中途崩溃时重试重跑。
+    # 批量 API 内部分块容错提交（无长事务/悬挂事务），父目录行一并入册。
+    files_repo.upsert_many_from_disk(svc.db, svc.store, rows_map)
+    files_repo.upsert_parents_from_disk(svc.db, svc.store, rows_map)
     # 包元信息（最近抽取器；包可能已被替换/删除——尽力而为）
     try:
         bd = bundles.bundle_dir(res.get("bundle_nf", ""), res.get("bundle_version", ""))
@@ -361,7 +366,7 @@ def cancel_gate(job_id: str) -> None:
     每次重试都对完整清单精确索引对账：即使上次已改完文件、仅索引提交失败，
     本次也能清掉幽灵节点或恢复旧节点。
     """
-    from ..repos import extract_files_repo
+    from ..repos import extract_files_repo, files_repo
     from ..service import get_service, import_lock
     svc = get_service()
     with import_lock:
@@ -384,6 +389,8 @@ def cancel_gate(job_id: str) -> None:
         # apply 可能已分块提交过索引。必须总是对完整 manifest 补偿，不能只用
         # 本轮改动列表：前一轮可能已还原文件、却在 reindex 中断。
         svc.reindex_paths(r["path"] for r in rows)
+        files_repo.upsert_many_from_disk(svc.db, svc.store, [r["path"] for r in rows])
+        files_repo.upsert_parents_from_disk(svc.db, svc.store, [r["path"] for r in rows])
     # 终态先落库，再删可恢复资料。
     jobs.update_job(job_id, status="cancelled")
     cleanup(job_id)
@@ -401,7 +408,7 @@ def revert_job(job_id: str, deleted_by: str = "") -> dict:
     """移除本次抽取的内容：add→软删进回收站；modify→还原 originals 旧版。
     sha 守卫：磁盘内容 ≠ 清单记录（后续任务已覆盖）→ 跳过不误删。
     调用方须持 kind 互斥。"""
-    from ..repos import extract_files_repo, trash_repo
+    from ..repos import extract_files_repo, files_repo, trash_repo
     from ..service import get_service, import_lock
     j = jobs.get_job(job_id)
     res = dict(j.result or {})
@@ -453,6 +460,8 @@ def revert_job(job_id: str, deleted_by: str = "") -> dict:
         # 同 cancel：索引补偿失败后的重试必须覆盖完整清单，即便本轮因 sha
         # 守卫未再次修改文件，也要让 objects/FTS 与当前 live 状态收敛。
         out["reindex"] = svc.reindex_paths(r["path"] for r in rows)
+        files_repo.upsert_many_from_disk(svc.db, svc.store, [r["path"] for r in rows])
+        files_repo.upsert_parents_from_disk(svc.db, svc.store, [r["path"] for r in rows])
 
     # 终态先于 originals/清单清理；落库失败时仍可幂等重试。
     jobs.update_job(job_id, status="done", result={
@@ -488,6 +497,12 @@ def _reconcile_applying(job, res: dict, svc, extract_files_repo, fts_repo) -> No
     if all_applied:
         all_applied = fts_repo.integrity_ok(svc.db)
     if all_applied:
+        # apply 的耐久顺序是 objects/FTS → files 户口 → job done。若进程恰好
+        # 崩在前两者之间，重启对账必须补齐完整清单及父目录后才能确认终态。
+        from ..repos import files_repo
+        paths = [row["path"] for row in manifest]
+        files_repo.upsert_many_from_disk(svc.db, svc.store, paths)
+        files_repo.upsert_parents_from_disk(svc.db, svc.store, paths)
         stats = dict(res.get("applied") or {})
         stats.update(
             added=sum(1 for row in manifest if row["op"] == "add"

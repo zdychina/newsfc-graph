@@ -5,6 +5,7 @@
 """
 import json
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -316,3 +317,70 @@ def test_search_telemetry_parity(tmp_data_dir, monkeypatch):
     n_object = db.execute(
         "SELECT COUNT(*) FROM telemetry WHERE level='object'").fetchone()[0]
     assert n_object == 0
+
+
+# ---------------- search_files 第四对（2026-09-29） ----------------
+
+def test_search_files_parity_query(tmp_data_dir, monkeypatch):
+    _seed(tmp_data_dir, monkeypatch)
+    args = {**CTX, "query": "ADD DEMO"}
+    with TestClient(app) as c:
+        mcp_out = _mcp_ok(c, "search_files", args)
+        rest = c.post("/api/v1/files", json=args)
+    assert rest.status_code == 200, rest.text
+    assert mcp_out == rest.json()
+
+
+def test_search_files_parity_ls_dir_rows_and_error(tmp_data_dir, monkeypatch):
+    _seed(tmp_data_dir, monkeypatch)
+    with TestClient(app) as c:
+        mcp_ls = _mcp_ok(c, "search_files", {**CTX, "path": "Command"})
+        rest_ls = c.post("/api/v1/files", json={**CTX, "path": "Command"})
+        mcp_err = _mcp_err(c, "search_files", {**CTX, "path": "NoSuch"})
+        rest_err = c.post("/api/v1/files", json={**CTX, "path": "NoSuch"})
+    assert rest_ls.status_code == 200, rest_ls.text
+    assert mcp_ls == rest_ls.json()   # 目录行 obj_id/version=None 两边同构
+    assert rest_err.status_code == 422
+    assert mcp_err == rest_err.json()  # 错误 envelope 同构
+
+
+def test_search_files_core_validation_failure_parity_and_telemetry(
+        tmp_data_dir, monkeypatch):
+    """schema 可接受、core 拒绝的空白 query：双通道同构且各留一条失败打点。"""
+    _seed(tmp_data_dir, monkeypatch)
+    args = {**CTX, "query": "  "}
+    with TestClient(app) as c:
+        mcp_err = _mcp_err(c, "search_files", args)
+        rest = c.post("/api/v1/files", json=args)
+    assert rest.status_code == 422
+    assert mcp_err == rest.json()
+
+    from app.telemetry.recorder import flush as flush_telemetry
+    assert flush_telemetry()
+    from app.service import get_service
+    rows = get_service().db.execute(
+        "SELECT caller, endpoint, result FROM telemetry "
+        "WHERE endpoint IN ('mcp:search_files', '/files') AND level='tool' "
+        "ORDER BY rowid"
+    ).fetchall()
+    assert [(r["caller"], r["endpoint"]) for r in rows] == [
+        ("mcp", "mcp:search_files"), ("skill", "/files")]
+    for row in rows:
+        assert json.loads(row["result"])["error"]["code"] == "INVALID_ARGUMENT"
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("query", "q" * 201),
+    ("path", "p" * 1025),
+    ("ext", "e" * 65),
+    ("after", "a" * 1025),
+])
+def test_search_files_length_validation_error_is_identical_across_channels(
+        tmp_data_dir, monkeypatch, field, value):
+    _seed(tmp_data_dir, monkeypatch)
+    args = {**CTX, field: value}
+    with TestClient(app) as c:
+        mcp_err = _mcp_err(c, "search_files", args)
+        rest = c.post("/api/v1/files", json=args)
+    assert rest.status_code == 422
+    assert mcp_err == rest.json()

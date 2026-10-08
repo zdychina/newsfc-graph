@@ -137,3 +137,19 @@ def test_version_application_sort(tmp_data_dir, monkeypatch):
     build_index_db(s.db, s.store, s.registry)
     idx = Index.load_from_db(s.db, s.registry)
     assert idx.latest_version_of_id("alpha@MMLCommand@ADD DEMO") == "20.10.0"
+
+
+def test_files_rare_ext_cursor_query_uses_composite_index(tmp_data_dir, monkeypatch):
+    """稀有扩展名 + path 游标应一次走 (ext, path)，不能先扫全 path。"""
+    s = _setup(tmp_data_dir, monkeypatch)
+    indexes = {r[1] for r in s.db.execute("PRAGMA index_list(files)").fetchall()}
+    assert "idx_files_ext_path" in indexes
+
+    plan = s.db.execute(
+        "EXPLAIN QUERY PLAN SELECT path FROM files "
+        "WHERE ext=? AND path>? ORDER BY path LIMIT ?",
+        ("drawio", "Feature/", 100),
+    ).fetchall()
+    detail = " ".join(r[3].lower() for r in plan)
+    assert "idx_files_ext_path" in detail
+    assert "ext=? and path>?" in detail

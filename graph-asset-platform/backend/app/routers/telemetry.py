@@ -21,7 +21,7 @@ def telemetry_skill_usage(
     limit: int = Query(default=1000, ge=1, le=10000, description="单批最大行数"),
     start: str = Query(default="", description="时间窗起点（ISO8601 或纯日期；首轮 since 空时生效）"),
     end: str = Query(default="", description="时间窗终点（ISO8601 或纯日期=含当天）；翻页全程生效"),
-    scope: str = Query(default="call", description="call=调用级（默认，每次调用 1 行：REST /md、/domains + MCP 5 工具，含 params/result）；object=对象级细粒度（每对象 1 行，单独导出用）；all=两类全含"),
+    scope: str = Query(default="call", description="call=调用级（默认，每次 REST/MCP 图谱工具调用 1 行，含 params/result）；object=对象级细粒度（每对象 1 行，单独导出用）；all=两类全含"),
 ):
     """底表导出（供外部系统对接）。
 

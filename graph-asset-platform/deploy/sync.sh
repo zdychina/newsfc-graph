@@ -115,7 +115,12 @@ check_manifests() {
     for m in pyproject.toml package.json; do
         [ -f "$MANIFEST_BASELINE_DIR/$m" ] && have_baseline=1 && break
     done
-    [ $have_baseline -eq 0 ] && return 0
+    if [ $have_baseline -eq 0 ]; then
+        for m in pyproject.toml package.json; do
+            [ -f "$STAGE_DIR/$m" ] && cp -f "$STAGE_DIR/$m" "$MANIFEST_BASELINE_DIR/$m"
+        done
+        return 0
+    fi
 
     local changed=()
     local have_pkg=0
@@ -167,10 +172,6 @@ cmd_apply() {
     rm -rf backend/app frontend/dist 2>/dev/null || true
     mv "$STAGE_DIR/backend/app" backend/app
     mv "$STAGE_DIR/frontend/dist" frontend/dist
-    mkdir -p "$MANIFEST_BASELINE_DIR"
-    for m in pyproject.toml package.json; do
-        [ -f "$STAGE_DIR/$m" ] && cp -f "$STAGE_DIR/$m" "$MANIFEST_BASELINE_DIR/$m"
-    done
     rm -rf backend/app.old frontend/dist.old
     SWAP_ACTIVE=false
     check_manifests

@@ -162,3 +162,60 @@ def test_updated_and_skipped_survive_registry_reload():
     jobs._registry.clear()
     restored = get_job(job.job_id)
     assert (restored.added, restored.updated, restored.skipped) == (5, 3, 4)
+
+
+def test_persist_no_transaction_tolerated_as_success(monkeypatch):
+    """commit 被并发写者抢先提交（no transaction）→ 按成功处理：不抛、不重试、
+    正常发布 _registry（service._commit 同款竞态，2026-09-29 修复锁定）。"""
+    from app import jobs
+
+    class StolenCommit:
+        def __init__(self):
+            self.commits = 0
+
+        def execute(self, *_args, **_kwargs):
+            return None
+
+        def commit(self):
+            self.commits += 1
+            raise sqlite3.OperationalError(
+                "cannot commit - no transaction is active")
+
+        def rollback(self):
+            return None
+
+    fake = StolenCommit()
+    monkeypatch.setattr(jobs, "_conn", fake)
+    try:
+        j = create_job(kind="product_doc_mine", nf="AMF", version="20.15.2")
+        assert fake.commits == 1  # 单次即按成功返回（不走 busy 重试）
+        published = get_job(j.job_id)  # registry 命中，不触 DB
+        assert published is not None and published.status == "processing"
+    finally:
+        jobs._registry.pop(j.job_id, None)
+
+
+def test_persist_busy_commit_still_raises_after_retries(monkeypatch):
+    """其他 OperationalError（locked）不受无事务容忍影响：重试耗尽仍显式抛
+    JobPersistenceError（fail closed 不降级）。"""
+    from app import jobs
+
+    job = create_job(kind="product_doc_mine", nf="UDG", version="20.15.2")
+
+    class LockedCommit:
+        def execute(self, *_args, **_kwargs):
+            return None
+
+        def commit(self):
+            raise sqlite3.OperationalError("database is locked")
+
+        def rollback(self):
+            return None
+
+    monkeypatch.setattr(jobs, "_conn", LockedCommit())
+    monkeypatch.setattr(jobs, "_PERSIST_RETRY_DELAYS", (0, 0), raising=False)
+    try:
+        with pytest.raises(jobs.JobPersistenceError):
+            update_job(job.job_id, status="done")
+    finally:
+        jobs._registry.pop(job.job_id, None)

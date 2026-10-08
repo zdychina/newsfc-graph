@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from ..attribution import telemetry_attribution
+from ..file_query import search_files_core
 from ..graph_query import contracts as gq
 from ..graph_query import read as graph_read
 from ..graph_query import search as graph_search
@@ -160,7 +161,7 @@ async def search_graph(request: Request):
     domain/scenario/page/size + AGENT_USERNAME/AGENT_SESSION_ID，extra=forbid）。
     响应与 MCP content JSON 完全相同（SearchGraphResponse）；错误 envelope：
     422 INVALID_ARGUMENT（枚举/越界/未知字段）、422 INVALID_FILTER(_COMBINATION)
-    （带 available_values）、413 SEARCH_TOO_BROAD、503 INDEX_REBUILDING（retryable）。
+    （带 available_values）、503 INDEX_REBUILDING（retryable）。
     打点：1 条 tool 行（caller=skill、endpoint=/search），无 object 行——与
     MCP §7.9 同口径。
     """
@@ -194,4 +195,40 @@ async def search_graph(request: Request):
                              1 for c in out["diagnostics"]["term_counts"].values()
                              if c > 0),
                          "recovery_codes": out["diagnostics"]["recovery_codes"]})
+    return out
+
+
+@router.post("/files")
+async def search_files(request: Request):
+    """文件名搜索/目录浏览（与 MCP ``search_files`` 完全同构，spec 2026-09-29）。
+
+    请求体 = MCP 工具参数 + 归因字段（query/path/ext/recursive/limit/after +
+    AGENT_USERNAME/AGENT_SESSION_ID，extra=forbid；query/path/ext 至少一个）。
+    响应与 MCP content JSON 完全相同（SearchFilesResponse）；错误 envelope 同
+    /search。打点：1 条 tool 行（caller=skill、endpoint=/files），无逐文件行。
+    """
+    tel_params: dict = {}
+    req = None
+    try:
+        req = await _parse_body(request, gq.RestFilesRequest)
+        tel_params = {k: v for k, v in {
+            "query": req.query, "path": req.path, "ext": req.ext,
+            "recursive": req.recursive, "limit": req.limit,
+            "after": req.after}.items() if v is not None}
+        out = search_files_core(query=req.query, path=req.path, ext=req.ext,
+                                recursive=req.recursive, limit=req.limit,
+                                after=req.after)
+    except gq.GraphQueryError as e:
+        _record_error("/files", request, req, e, params=tel_params)
+        return _error_response(e.error)
+    except Exception as e:  # noqa: BLE001
+        print(f"[skill_compat] INTERNAL_ERROR /files: {e!r}", flush=True)
+        _record_error("/files", request, req, e, params=tel_params)
+        return _error_response(gq.GraphError(
+            code=gq.INTERNAL_ERROR, message=gq.INTERNAL_ERROR_MESSAGE))
+    _record_call("/files", request, req.AGENT_USERNAME, req.AGENT_SESSION_ID,
+                 params=tel_params,
+                 result={"total": out["total"], "returned": len(out["files"]),
+                         "top_paths": [f["path"] for f in out["files"][:10]],
+                         "has_more": out["has_more"]})
     return out

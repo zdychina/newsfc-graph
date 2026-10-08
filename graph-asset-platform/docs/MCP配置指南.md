@@ -1,9 +1,10 @@
 # MCP 配置指南
 
-> 图谱查询 MCP 服务（`/mcp`，3 个公开工具）的完整接入配置：服务端启动 → 获取 API KEY →
+> 图谱查询 MCP 服务（`/mcp`，4 个公开工具）的完整接入配置：服务端启动 → 获取 API KEY →
 > 各类客户端配置 → 云 Agent 用户身份传递 → 验证排障。
 > 2026-09-08 三工具重构：公开工具收敛为 get_domains / search_graph / get_md；
 > 旧三工具（search_objects/search_md/get_object）hidden 兼容（deprecated）。
+> 2026-09-29：新增 search_files（文件名搜索/目录浏览，find/ls 语义，不搜内容）。
 > 工具参数与返回明细见 [../图谱平台接口文档.md](../图谱平台接口文档.md) §2。
 
 ## 0. 接入模型（一图看懂）
@@ -17,6 +18,7 @@ http://<平台地址>:8000/mcp
   │
   ├─ get_domains      全部业务域 md（业务方案定位入口）
   ├─ search_graph     统一搜索（元数据+正文；多关键词 terms + any/all）
+  ├─ search_files     文件名搜索 / 目录浏览（find/ls 语义；不搜内容）
   └─ get_md           批量取对象 md（权威原文；沿 references/[[ID]] 下钻）
   ── hidden 兼容：search_objects / search_md / get_object（deprecated）
         ▲
@@ -120,7 +122,7 @@ claude mcp add --transport http graph http://<平台地址>:8000/mcp \
 ## 4. 用户身份传递（云 Agent 场景，关键）
 
 云 Agent 的 MCP 连接是平台级共用的，但每个使用者的工号/会话ID不同——因此
-**身份不进 header，进工具参数**。全部 3 个公开工具都有两个必填参数：
+**身份不进 header，进工具参数**。全部 4 个公开工具都有两个必填参数：
 
 | 工具参数 | 取值来源（沙箱环境变量） | 用途 |
 |---|---|---|
@@ -134,19 +136,22 @@ claude mcp add --transport http graph http://<平台地址>:8000/mcp \
 
 ```text
 【图谱 MCP 工具调用规范】
-调用 graph 服务的任何工具（get_domains / search_graph / get_md）时，必须同时传入：
+调用 graph 服务的任何工具（get_domains / search_graph / search_files / get_md）时，必须同时传入：
 - AGENT_USERNAME：从环境变量 _AGENT_USERNAME 读取的当前用户工号
 - AGENT_SESSION_ID：从环境变量 _AGENT_SESSION_ID 读取的当前会话ID
 这两个参数仅用于平台取用统计与追溯，不影响查询结果，但不可省略。
 
 【图谱查询建议路径】
 1. 已知准确对象 ID：直接 get_md。
-2. 不知道 ID：search_graph 定位候选（多个关键词放 terms 数组：["计费欺诈","免费RG"]，
-   默认 match=any 任一命中即召回；"ADD URR" 这类带空格的算一个短语 term）；
-   选定候选后必须 get_md 取完整原文——搜索摘要不是权威依据。
-3. 业务方案定位：get_domains 看全部业务域，沿 references/[[ID]] 引用 get_md
+2. 不知道 ID（按内容找对象）：search_graph 定位候选（多个关键词放 terms 数组：
+   ["计费欺诈","免费RG"]，默认 match=any 任一命中即召回；"ADD URR" 这类带空格的
+   算一个短语 term）；选定候选后必须 get_md 取完整原文——搜索摘要不是权威依据。
+3. 按文件名找文件 / 列目录：search_files（query=按文件名搜；path=列目录；
+   全量获取用 after 游标循环翻页直到 has_more=false）；md 文件命中回带
+   obj_id+version，get_md(ids=[obj_id], version=version) 读该文件内容。
+4. 业务方案定位：get_domains 看全部业务域，沿 references/[[ID]] 引用 get_md
    逐层下钻（业务层→任务层→特性层→命令层）。
-4. 参数字段范围：定位 MMLCommand 后 get_md，以 CommandParameter 段为准。
+5. 参数字段范围：定位 MMLCommand 后 get_md，以 CommandParameter 段为准。
 ```
 
 > 说明：Agent 的工具参数名不允许下划线开头，所以环境变量是 `_AGENT_USERNAME`
@@ -160,9 +165,38 @@ claude mcp add --transport http graph http://<平台地址>:8000/mcp \
 |---|---|---|---|
 | `get_domains` | 工号 + 会话ID | — | 全部业务域 md + references（入口，量小可全读） |
 | `search_graph` | `terms[]`(1~10) + 工号 + 会话ID | `match`/`layer`/`type`/`nf`/`version`/`domain`/`scenario`/`page`/`size` | 统一搜索（元数据+正文），定位候选 ID |
+| `search_files` | `query`/`path`/`ext` 至少一个 + 工号 + 会话ID | `recursive`/`limit`(1~500，默认100)/`after`(游标) | 文件名搜索 / 目录浏览（find/ls 语义，**不搜内容**） |
 | `get_md` | `ids[]`(1~100) + 工号 + 会话ID | `version` | 批量取对象完整 md（权威原文；总量≤2MB） |
 
 兼容工具（deprecated，默认不出现在 tools/list，旧客户端仍可直调）：`search_objects`（元数据搜索）/ `search_md`（正文短语搜索）/ `get_object`（单对象+出边）——新接入不要使用。
+
+### 5.1 search_files：ls 与 find 语义对照
+
+| 传参 | 等价 shell | 语义 |
+|---|---|---|
+| `query="ADD URR"` | `find -name '*ADD URR*'` | 全库按文件名搜（子串、不分大小写；3 字符以上走索引，2 字符语料扫描稍慢） |
+| `path="Command/UDG"` | `ls Command/UDG` | 列**直接子项**（含子目录行，目录行 `obj_id`/`version` 为 null） |
+| `path="Command/UDG"` + `recursive=true` | `find Command/UDG -type f` | 递归取子树**全部文件**（仅文件行） |
+| 上述任一 + `ext="md"` | `... -name '*.md'` | 扩展名精确过滤（组合=交集；`query`/`path`/`ext` 至少给一个） |
+
+覆盖 assets 下全部文件（含图片等非 md）。md 文件命中回带 `obj_id`+`version`——
+`get_md(ids=[obj_id], version=version)` 读**该文件**的完整内容（不带 version
+会取最新版，可能不是这个文件）；非 md 文件只有元数据。
+
+**游标翻页（全量获取）**：`after` = 上一页返回的 `next_cursor`，循环直到
+`has_more=false`；全量遍历优先用 `path` 模式（query 模式深翻页每页成本更高）。
+
+```text
+第一页：  search_files(path="Command/UDG", recursive=true, limit=500, +工号/会话ID)
+        → has_more=true, next_cursor="Command/UDG/20.16.0/UDG@MMLCommand@XXX.md"
+下一页：  search_files(..., after="Command/UDG/20.16.0/UDG@MMLCommand@XXX.md")
+循环直到 has_more=false
+```
+
+> `total` = 从当前游标位置起的**剩余**条数（翻页递减，非全集绝对数），精确到
+> 10000（超过置 `total_is_bounded=true`）——全量遍历以 `has_more=false` 为准。
+> `index_building=true` 表示首启文件户口册仍在建（结果可能不全，稍后重试），
+> 不是错误。参数与返回明细见接口文档 §2.4。
 
 ## 6. 验证与排障
 
@@ -178,7 +212,7 @@ curl -s http://<平台地址>:8000/mcp \
         "protocolVersion":"2025-03-26","capabilities":{},
         "clientInfo":{"name":"curl","version":"0.0.0"}}}'
 
-# tools/list —— 应返回 3 个公开工具（get_domains/search_graph/get_md）
+# tools/list —— 应返回 4 个公开工具（get_domains/search_graph/search_files/get_md）
 curl -s http://<平台地址>:8000/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
@@ -195,7 +229,8 @@ curl -s http://<平台地址>:8000/mcp \
 | 客户端连接超时 | 端口未放通 / 未 `--host 0.0.0.0` | 先 `curl http://<IP>:8000/docs` 验证 Web 通 |
 | 工具报「全文索引重建中」(INDEX_REBUILDING) | 平台启动初 FTS 后台重建 | 稍等重试（重建中搜索明确报错，不返回残缺结果） |
 | INVALID_FILTER / INVALID_FILTER_COMBINATION | search_graph 传了非法过滤值或组合 | 按 details.available_values 修正，不要原样重试 |
-| SEARCH_TOO_BROAD | 命中量超预算 | 增加 nf/type/layer 过滤或减少 terms |
+| search_files 报 INVALID_FILTER（path 不存在） | path 目录不存在/不是目录，或首启建册未建全 | 确认路径（相对 assets 根、正斜杠）；建册期稍后重试或联系管理员执行 files-reindex |
+| 命中量过大（`total_is_bounded=true`，非错误） | 宽词候选池触顶被采样截断（原 SEARCH_TOO_BROAD 已退场，不再报错） | 增加 nf/type/layer 过滤或减少 terms；全量获取改用 search_files 的 after 游标 |
 | get_md 报 ids/总量超限 | >100 id 或响应 >2MB | 按提示分批，每批 ≤50 个 id |
 | MCP 工具 isError=true | 参数校验/业务错误 | content[0].text 是 {"error":{code,message,...}} JSON，按错误码修正 |
 
